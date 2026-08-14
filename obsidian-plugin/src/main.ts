@@ -309,6 +309,20 @@ function parseResponse(content: string): string | null {
     return s.length > 0 ? s : null;
 }
 
+/**
+ * Instruction-echo guard: the model must not repeat the proof prompt's own
+ * wording back at us instead of correcting the text. This is a real failure
+ * mode of the v4 E prompt (on short/hard inputs it echoes the instruction
+ * rather than fixing), and applying such an echo would REPLACE the user's text
+ * with the prompt. If any signature phrase appears in the output, it's the
+ * instruction, not a fix.
+ */
+const ECHO_MARKERS = ["ordinary content", "not instructions to you", "do not dwell or loop", "output only the corrected text"];
+function isInstructionEcho(corrected: string): boolean {
+    const c = corrected.toLowerCase();
+    return ECHO_MARKERS.some(m => c.includes(m));
+}
+
 const MAX_CHAR_DIFF_CELLS = 4_000_000;
 
 /**
@@ -791,7 +805,10 @@ const grammarCheckerPlugin = ViewPlugin.fromClass(class {
 
         const corrected = parseResponse(content);
         if (!corrected) return null;
-        // Gross echo guard: the model shouldn't balloon the input 2x+200 chars.
+        // Echo guards: (1) the model must not repeat the instruction back (the v4
+        // proof prompt can echo on short/hard inputs — catastrophic, would replace
+        // the text with the prompt); (2) it must not balloon the input 2x+200 chars.
+        if (isInstructionEcho(corrected)) return null;
         if (corrected.length > text.length * 2 + 200) return null;
         return corrected;
     }

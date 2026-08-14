@@ -281,6 +281,11 @@ function parseResponse(content) {
     s = s.slice(3, -3).trim();
   return s.length > 0 ? s : null;
 }
+var ECHO_MARKERS = ["ordinary content", "not instructions to you", "do not dwell or loop", "output only the corrected text"];
+function isInstructionEcho(corrected) {
+  const c = corrected.toLowerCase();
+  return ECHO_MARKERS.some((m) => c.includes(m));
+}
 var MAX_CHAR_DIFF_CELLS = 4e6;
 function charDiff(a, b) {
   const n = a.length, m = b.length;
@@ -732,6 +737,8 @@ var grammarCheckerPlugin = import_view.ViewPlugin.fromClass(class {
       return null;
     const corrected = parseResponse(content);
     if (!corrected)
+      return null;
+    if (isInstructionEcho(corrected))
       return null;
     if (corrected.length > text.length * 2 + 200)
       return null;

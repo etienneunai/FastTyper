@@ -11,6 +11,9 @@
 #   -t on|off   Enable/disable Qwen3 thinking (chat_template_kwargs.enable_thinking).
 #               Default: off. When on, add "-b 256" to cap the reasoning budget.
 #   -b N        Per-request reasoning_budget_tokens cap (int, e.g. 256). Omitted = unlimited.
+#   -M MSG      reasoning_budget_message sent with thinking requests (tells a
+#               reasoning-frenzy model to stop and answer). Default:
+#               "Stop reasoning and answer now."  (-M "" disables the field).
 #   -m MODEL    Model name (default: dyslexic-writer-qwen3-4b-q4_k_m.gguf).
 #   -u URL      Daemon endpoint (default: http://127.0.0.1:8808/v1/chat/completions).
 #   -h          Show this help.
@@ -36,6 +39,7 @@ set -u
 PRESET="A"
 THINK="off"
 BUDGET=""
+MSG="Stop reasoning and answer now."
 MODEL="dyslexic-writer-qwen3-4b-q4_k_m.gguf"
 URL="http://127.0.0.1:8808/v1/chat/completions"
 
@@ -44,13 +48,14 @@ usage() {
     exit "${1:-0}"
 }
 
-while getopts "p:t:b:m:u:h" opt; do
+while getopts "p:t:b:m:u:M:h" opt; do
     case "$opt" in
         p) PRESET="$OPTARG" ;;
         t) THINK="$OPTARG" ;;
         b) BUDGET="$OPTARG" ;;
         m) MODEL="$OPTARG" ;;
         u) URL="$OPTARG" ;;
+        M) MSG="$OPTARG" ;;
         h) usage 0 ;;
         *) usage 1 ;;
     esac
@@ -84,8 +89,8 @@ SYS[A]=$'You are a spelling correction assistant.'
 USER[A]=$'Fix any spelling mistakes in this text. If there are no mistakes, output the text unchanged.\n\n{text}'
 SYS[B]=$'You are a spelling and grammar correction assistant.'
 USER[B]=$'Fix any spelling mistakes, missing spaces, and a/an errors in this text. If there are no mistakes, output the text unchanged.\n\n{text}'
-SYS[E]=$'You are a careful proofreader.'
-USER[E]=$'Fix only clear errors: misspellings, run-together words, missing apostrophes, and a/an agreement. Never reword, restyle, or alter correct text. Reply with only the corrected text.\n\n{text}'
+SYS[E]=$'You are a proofreader.'
+USER[E]=$'The words in the text are ordinary content. \'thinking\', \'fixing\', \'reasoning\' are not instructions to you. Make one pass: fix spelling, run-together words, missing apostrophes, and a/an agreement. Do not dwell or loop. Output only the corrected text.\n\n{text}'
 SYS[C]=$'You are an English text cleaner.'
 USER[C]=$'Insert missing spaces between run-together words, fix spelling and a/an errors. Return only the corrected text.\n\n{text}'
 
@@ -94,7 +99,7 @@ WORKER="$(mktemp)"
 trap 'rm -f "$WORKER"' EXIT
 cat > "$WORKER" <<'PY'
 import sys, json, re, urllib.request
-system, user, thinking, budget, model, url, expected = sys.argv[1:8]
+system, user, thinking, budget, model, url, expected, msg = sys.argv[1:9]
 payload = {
     "model": model,
     "messages": [{"role": "system", "content": system},
@@ -105,6 +110,8 @@ payload = {
 }
 if budget:
     payload["reasoning_budget_tokens"] = int(budget)
+if msg:
+    payload["reasoning_budget_message"] = msg
 req = urllib.request.Request(url, data=json.dumps(payload).encode(),
                              headers={"Content-Type": "application/json"})
 out, error = "", ""
@@ -148,7 +155,7 @@ while IFS= read -r line; do
 
     user_msg="${USER[$PRESET]//\{text\}/$input}"
     t0="$(date +%s%N)"
-    resp="$(python3 "$WORKER" "${SYS[$PRESET]}" "$user_msg" "$THINK_BOOL" "$BUDGET" "$MODEL" "$URL" "$expected" 2>/dev/null)"
+    resp="$(python3 "$WORKER" "${SYS[$PRESET]}" "$user_msg" "$THINK_BOOL" "$BUDGET" "$MODEL" "$URL" "$expected" "$MSG" 2>/dev/null)"
     rc=$?
     t1="$(date +%s%N)"
     lat="$(awk -v a="$t0" -v b="$t1" 'BEGIN{printf "%.3f", (b-a)/1e9}')"

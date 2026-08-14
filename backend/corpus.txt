@@ -1,4 +1,4 @@
-# FastTyper eval corpus (10 items). TEXT<TAB>EXPECTED.
+# FastTyper eval corpus (12 items). TEXT<TAB>EXPECTED.
 # PASS = whitespace-collapsed, case-insensitive EXPECTED is a substring of the corrected output.
 # Run:  ./backend/eval-corpus.sh -p E -t on -b 256 backend/corpus.txt
 # Expect 9/10 — item 7 (`youree`→`your`) is a known corpus ambiguity (the model
@@ -14,3 +14,6 @@ youree	your
 what a sahme	what a shame
 That is not what we want. It only makes those correctuobns after a bullet poiint. btw, still not working on new lines.	those corrections after a bullet point
 The quick brown fox jumps over the lazy dog.	The quick brown fox jumps over the lazy dog.
+# 11–12 are thinking-path regressions (Bug A partial-fix, Bug B stuck-loop) — run with -t on -b 256.
+Okay so this must be on full thinking , which neans basiclally all errors hosuld be fixed - maybe nto that one but well see.	basically all errors should be fixed
+see thats the issue - every time i type a correct sentence now it actuall y does worse than the toher one ... apostrpehe.	that's the issue

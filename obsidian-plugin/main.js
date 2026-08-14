@@ -68,24 +68,6 @@ var PROMPT_PRESETS = [
 ];
 var LLM_LOG_PATH = "/home/etienne/Projects/FastTyper/llm-log.txt";
 var ABBREVIATIONS = /* @__PURE__ */ new Set(["e.g.", "i.e.", "etc.", "Mr.", "Mrs.", "Ms.", "Dr.", "St.", "vs.", "no."]);
-var DEBUG_LOG_PATH = "/home/etienne/Projects/FastTyper/trigger-debug.log";
-function debugLog(msg) {
-  try {
-    if (fsModule === null) {
-      try {
-        fsModule = require("fs");
-      } catch (e) {
-        fsModule = false;
-      }
-    }
-    if (!fsModule)
-      return;
-    fsModule.appendFileSync(DEBUG_LOG_PATH, `${(/* @__PURE__ */ new Date()).toISOString()} ${msg}
-`, "utf8");
-  } catch (e) {
-    console.error("FastTyper: failed to write debug log", e);
-  }
-}
 var fsModule = null;
 function logExchange(sent, received) {
   try {
@@ -400,7 +382,6 @@ var grammarCheckerPlugin = import_view.ViewPlugin.fromClass(class {
       this.verifyPos = update.changes.mapPos(this.verifyPos, 1);
     if (!update.docChanged)
       return;
-    debugLog(`UPDATE docChanged chgCount=${update.changes.length} isAutoApply=${update.transactions.some((tr) => tr.effects.some((e) => e.is(setCorrections) || e.is(revertCorrection) || e.is(clearCorrections)))} paused=${this.paused} pendingVerify=${this.verifyTimeout !== null} isPending=${this.isPending} queued=${!!this.queued}`);
     const isAutoApply = update.transactions.some((tr) => tr.effects.some((e) => e.is(setCorrections) || e.is(revertCorrection) || e.is(clearCorrections) || e.is(setProcessing)));
     if (isAutoApply)
       return;
@@ -424,7 +405,6 @@ var grammarCheckerPlugin = import_view.ViewPlugin.fromClass(class {
       let found = null;
       update.transactions[t].changes.iterChanges((fromA, toA, fromB, toB, inserted) => {
         const s = inserted.toString();
-        debugLog(`  t${t} change ${fromA}->${toA} | ${fromB}->${toB} | ins=${JSON.stringify(s)}`);
         if (fromA !== toA && !s.includes("\n"))
           return;
         for (let k = s.length - 1; k >= 0; k--) {
@@ -450,7 +430,6 @@ var grammarCheckerPlugin = import_view.ViewPlugin.fromClass(class {
     this.verifyChar = "";
     const doc = this.view.state.doc;
     if (pos >= doc.length || doc.sliceString(pos, pos + 1) !== ch) {
-      debugLog(`  confirm REJECT ch=${ch} pos=${pos} len=${doc.length} present=${pos < doc.length ? doc.sliceString(pos, pos + 1) : "EOF"}`);
       return;
     }
     if (ch === ".") {
@@ -462,23 +441,14 @@ var grammarCheckerPlugin = import_view.ViewPlugin.fromClass(class {
         return;
     }
     const span = ch === "\n" ? this.lineSpan(pos) : this.sentenceSpan(pos);
-    if (!span) {
-      debugLog(`  confirm REJECT ch=${ch} pos=${pos} span=null (lineSpan failed)`);
+    if (!span)
       return;
-    }
-    if (span.to - span.from > MAX_UNIT_CHARS) {
-      debugLog(`  confirm REJECT ch=${ch} pos=${pos} too-long ${span.to - span.from}`);
+    if (span.to - span.from > MAX_UNIT_CHARS)
       return;
-    }
-    if (doc.sliceString(span.from, span.to).trim().length < MIN_UNIT_CHARS) {
-      debugLog(`  confirm REJECT ch=${ch} pos=${pos} too-short "${doc.sliceString(span.from, span.to).trim()}"`);
+    if (doc.sliceString(span.from, span.to).trim().length < MIN_UNIT_CHARS)
       return;
-    }
-    if (this.containsCode(span.from, span.to)) {
-      debugLog(`  confirm REJECT ch=${ch} pos=${pos} contains-code`);
+    if (this.containsCode(span.from, span.to))
       return;
-    }
-    debugLog(`  confirm FIRE ch=${ch} pos=${pos} span=[${span.from},${span.to}) unit="${doc.sliceString(span.from, span.to).trim()}"`);
     this.queued = span;
     this.maybeFire();
   }
@@ -770,9 +740,7 @@ var FastTyperPlugin = class extends import_obsidian.Plugin {
     this.settingsTab = null;
   }
   async onload() {
-    var _a, _b;
     console.log("Loading FastTyper plugin");
-    debugLog(`ONLOAD plugin v${(_b = (_a = this.manifest) == null ? void 0 : _a.version) != null ? _b : "?"} loaded`);
     const data = await this.loadData();
     if (data == null ? void 0 : data.paused)
       correctionsPaused = true;

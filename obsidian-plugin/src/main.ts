@@ -72,21 +72,6 @@ const ABBREVIATIONS = new Set(["e.g.", "i.e.", "etc.", "Mr.", "Mrs.", "Ms.", "Dr
 
 declare const require: (id: string) => any;
 
-/** Temporary trigger-path diagnostics (newline not firing). Appended per call. */
-const DEBUG_LOG_PATH = "/home/etienne/Projects/FastTyper/trigger-debug.log";
-
-function debugLog(msg: string): void {
-    try {
-        if (fsModule === null) {
-            try { fsModule = require("fs"); } catch { fsModule = false; }
-        }
-        if (!fsModule) return;
-        fsModule.appendFileSync(DEBUG_LOG_PATH, `${new Date().toISOString()} ${msg}\n`, "utf8");
-    } catch (e) {
-        console.error("FastTyper: failed to write debug log", e);
-    }
-}
-
 let fsModule: any = null;
 /** Append one `sent:\n…\nreceived:\n…` exchange to LLM_LOG_PATH. */
 function logExchange(sent: string, received: string): void {
@@ -433,10 +418,6 @@ const grammarCheckerPlugin = ViewPlugin.fromClass(class {
 
         if (!update.docChanged) return;
 
-        // Log every doc change BEFORE any early-return so a silent pause/auto-apply
-        // short-circuit is visible in the trace (the newline trigger was "not firing").
-        debugLog(`UPDATE docChanged chgCount=${update.changes.length} isAutoApply=${update.transactions.some(tr => tr.effects.some(e => e.is(setCorrections) || e.is(revertCorrection) || e.is(clearCorrections)))} paused=${this.paused} pendingVerify=${this.verifyTimeout !== null} isPending=${this.isPending} queued=${!!this.queued}`);
-
         // Ignore our own corrections/reverts so we don't re-trigger on them.
         // (setProcessing is effect-only so `!update.docChanged` already short-circuits
         // above — this is belt-and-suspenders in case a changes+setProcessing
@@ -468,7 +449,6 @@ const grammarCheckerPlugin = ViewPlugin.fromClass(class {
             let found: { pos: number; ch: string } | null = null;
             update.transactions[t].changes.iterChanges((fromA, toA, fromB, toB, inserted) => {
                 const s = inserted.toString();
-                debugLog(`  t${t} change ${fromA}->${toA} | ${fromB}->${toB} | ins=${JSON.stringify(s)}`);
                 // Only count pure insertions for punctuation triggers, but always
                 // count an inserted line break — Obsidian's list continuation
                 // (Enter at a bullet) lands as a replacement transaction like
@@ -498,7 +478,6 @@ const grammarCheckerPlugin = ViewPlugin.fromClass(class {
 
         const doc = this.view.state.doc;
         if (pos >= doc.length || doc.sliceString(pos, pos + 1) !== ch) {
-            debugLog(`  confirm REJECT ch=${ch} pos=${pos} len=${doc.length} present=${pos < doc.length ? doc.sliceString(pos, pos + 1) : "EOF"}`);
             return;
         }
 
@@ -512,24 +491,11 @@ const grammarCheckerPlugin = ViewPlugin.fromClass(class {
         }
 
         const span = ch === '\n' ? this.lineSpan(pos) : this.sentenceSpan(pos);
-        if (!span) {
-            debugLog(`  confirm REJECT ch=${ch} pos=${pos} span=null (lineSpan failed)`);
-            return;
-        }
-        if (span.to - span.from > MAX_UNIT_CHARS) {
-            debugLog(`  confirm REJECT ch=${ch} pos=${pos} too-long ${span.to - span.from}`);
-            return;
-        }
-        if (doc.sliceString(span.from, span.to).trim().length < MIN_UNIT_CHARS) {
-            debugLog(`  confirm REJECT ch=${ch} pos=${pos} too-short "${doc.sliceString(span.from, span.to).trim()}"`);
-            return;
-        }
-        if (this.containsCode(span.from, span.to)) {
-            debugLog(`  confirm REJECT ch=${ch} pos=${pos} contains-code`);
-            return;
-        }
+        if (!span) return;
+        if (span.to - span.from > MAX_UNIT_CHARS) return;
+        if (doc.sliceString(span.from, span.to).trim().length < MIN_UNIT_CHARS) return;
+        if (this.containsCode(span.from, span.to)) return;
 
-        debugLog(`  confirm FIRE ch=${ch} pos=${pos} span=[${span.from},${span.to}) unit="${doc.sliceString(span.from, span.to).trim()}"`);
         this.queued = span;
         this.maybeFire();
     }
@@ -889,7 +855,6 @@ export default class FastTyperPlugin extends Plugin {
 
     async onload() {
         console.log('Loading FastTyper plugin');
-        debugLog(`ONLOAD plugin v${(this.manifest as any)?.version ?? "?"} loaded`);
         const data = await this.loadData();
         if (data?.paused) correctionsPaused = true;
         if (typeof data?.capitalizeInitials === "boolean") capitalizeInitials = data.capitalizeInitials;

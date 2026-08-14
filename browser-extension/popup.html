@@ -8,6 +8,20 @@
   <h1>FastTyper</h1>
   <label class="row"><input type="checkbox" id="paused"> Pause corrections</label>
   <label class="row"><input type="checkbox" id="capitalize"> Capitalize sentence-initial letters</label>
+  <label for="prompt" class="bl-label">Correction prompt</label>
+  <select id="prompt" class="sel">
+    <option value="A">A — prod</option>
+    <option value="B">B — gram</option>
+    <option value="E">E — proof</option>
+    <option value="C">C — clean</option>
+    <option value="custom">Custom</option>
+  </select>
+  <div id="customPrompts" hidden>
+    <label for="customSystem" class="bl-label">Custom system prompt</label>
+    <textarea id="customSystem" rows="2" placeholder="You are a spelling correction assistant."></textarea>
+    <label for="customUser" class="bl-label">Custom user prompt ({text} = the unit)</label>
+    <textarea id="customUser" rows="3" placeholder="Fix any spelling mistakes in this text. If there are no mistakes, output the text unchanged."></textarea>
+  </div>
   <button id="acceptAll" class="btn">Accept all corrections</button>
   <div id="status" class="status">Daemon: checking…</div>
   <label for="blacklist" class="bl-label">Skip corrections on these sites (one per line)</label>

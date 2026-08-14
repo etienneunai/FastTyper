@@ -7,7 +7,7 @@
  * filesystem access, so the Obsidian plugin's llm-log.txt isn't available).
  */
 import {
-  buildPayload, LLM_URL, LLM_BASE, parseResponse,
+  buildPayload, LLM_URL, LLM_BASE, parseResponse, resolvePrompt, PROMPT_PRESETS,
   type Request, type Response, type LogEntry, type PushMsg,
 } from "./shared";
 
@@ -19,9 +19,22 @@ interface Settings {
   paused: boolean;
   capitalize: boolean;
   blacklist: string[];
+  /** Active prompt preset id (`PROMPT_PRESETS[i].id` or `"custom"`). */
+  promptId: string;
+  /** Custom system message (used when `promptId === "custom"`). */
+  customSystem: string;
+  /** Custom user-message template with `{text}` (used when `promptId === "custom"`). */
+  customUser: string;
 }
 
-const DEFAULT_SETTINGS: Settings = { paused: false, capitalize: true, blacklist: [] };
+const DEFAULT_SETTINGS: Settings = {
+  paused: false,
+  capitalize: true,
+  blacklist: [],
+  promptId: "A",
+  customSystem: PROMPT_PRESETS[0].system,
+  customUser: PROMPT_PRESETS[0].user,
+};
 
 async function getSettings(): Promise<Settings> {
   const got = await browser.storage.local.get(SETTINGS_KEY);
@@ -56,7 +69,8 @@ async function getLog(): Promise<LogEntry[]> {
 
 /** POST a sentence to the daemon → the corrected text (or null). */
 async function correct(text: string, url?: string): Promise<string | null> {
-  const body = JSON.stringify(buildPayload(text));
+  const s = await getSettings();
+  const body = JSON.stringify(buildPayload(text, resolvePrompt(s.promptId, s.customSystem, s.customUser)));
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 30_000);
   try {
@@ -131,6 +145,27 @@ browser.runtime.onMessage.addListener(
           )
         );
 
+      case "setPrompt":
+        return getSettings().then((s) =>
+          saveSettings({ ...s, promptId: msg.promptId }).then(
+            (): Response => ({ type: "correctResult", corrected: null })
+          )
+        );
+
+      case "setCustomSystem":
+        return getSettings().then((s) =>
+          saveSettings({ ...s, customSystem: msg.value }).then(
+            (): Response => ({ type: "correctResult", corrected: null })
+          )
+        );
+
+      case "setCustomUser":
+        return getSettings().then((s) =>
+          saveSettings({ ...s, customUser: msg.value }).then(
+            (): Response => ({ type: "correctResult", corrected: null })
+          )
+        );
+
       case "setBlacklist":
         return getSettings().then((s) =>
           saveSettings({ ...s, blacklist: msg.blacklist }).then(
@@ -140,7 +175,7 @@ browser.runtime.onMessage.addListener(
 
       case "getState":
         return Promise.all([getSettings(), daemonUp()]).then(
-          ([s, up]): Response => ({ type: "state", paused: s.paused, capitalize: s.capitalize, blacklist: s.blacklist, daemonUp: up })
+          ([s, up]): Response => ({ type: "state", paused: s.paused, capitalize: s.capitalize, blacklist: s.blacklist, promptId: s.promptId, customSystem: s.customSystem, customUser: s.customUser, daemonUp: up })
         );
 
       case "getLog":

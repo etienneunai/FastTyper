@@ -138,16 +138,69 @@ export function contextSnippet(text: string, from: number, to: number, original:
 }
 
 // ---------------------------------------------------------------------------
+// Selectable prompt presets (ported from main.ts PROMPT_PRESETS + activePrompt)
+// ---------------------------------------------------------------------------
+
+export interface PromptPreset {
+  id: string;
+  name: string;
+  system: string;
+  user: string;
+}
+
+/** id used to select the Custom prompt (editable system/user templates). */
+export const CUSTOM_PROMPT_ID = "custom";
+
+export const PROMPT_PRESETS: PromptPreset[] = [
+  {
+    id: "A",
+    name: "A — prod",
+    system: "You are a spelling correction assistant.",
+    user: "Fix any spelling mistakes in this text. If there are no mistakes, output the text unchanged.\n\n{text}",
+  },
+  {
+    id: "B",
+    name: "B — gram",
+    system: "You are a spelling and grammar correction assistant.",
+    user: "Fix any spelling mistakes, missing spaces, and a/an errors in this text. If there are no mistakes, output the text unchanged.\n\n{text}",
+  },
+  {
+    id: "E",
+    name: "E — proof",
+    system: "You are a careful proofreader.",
+    user: "Fix only clear errors: misspellings, run-together words, missing apostrophes, and a/an agreement. Never reword, restyle, or alter correct text. Reply with only the corrected text.\n\n{text}",
+  },
+  {
+    id: "C",
+    name: "C — clean",
+    system: "You are an English text cleaner.",
+    user: "Insert missing spaces between run-together words, fix spelling and a/an errors. Return only the corrected text.\n\n{text}",
+  },
+];
+
+/** A resolved system message + user template pair, ready for the payload. */
+export interface ActivePrompt {
+  system: string;
+  user: string;
+}
+
+/** The active pair for a stored `promptId` + custom fields (mirrors obsidian `activePrompt()`). */
+export function resolvePrompt(promptId: string, customSystem: string, customUser: string): ActivePrompt {
+  if (promptId === CUSTOM_PROMPT_ID) return { system: customSystem, user: customUser };
+  return PROMPT_PRESETS.find((p) => p.id === promptId) ?? PROMPT_PRESETS[0];
+}
+
+// ---------------------------------------------------------------------------
 // LLM payload (ported from main.ts request())
 // ---------------------------------------------------------------------------
 
 /** The body sent to the daemon. `text` is the bare sentence/line, already trimmed. */
-export function buildPayload(text: string): Record<string, unknown> {
+export function buildPayload(text: string, prompt: ActivePrompt): Record<string, unknown> {
   return {
     model: MODEL,
     messages: [
-      { role: "system", content: "You are a spelling correction assistant." },
-      { role: "user", content: "Fix any spelling mistakes in this text. If there are no mistakes, output the text unchanged.\n\n" + text },
+      { role: "system", content: prompt.system },
+      { role: "user", content: prompt.user.split("{text}").join(text) },
     ],
     temperature: 0,
     max_tokens: Math.min(2048, Math.ceil(text.length / 3) + 256),
@@ -167,12 +220,15 @@ export type Request =
   | { type: "getState" }
   | { type: "setPaused"; paused: boolean }
   | { type: "setCapitalize"; value: boolean }
+  | { type: "setPrompt"; promptId: string }
+  | { type: "setCustomSystem"; value: string }
+  | { type: "setCustomUser"; value: string }
   | { type: "setBlacklist"; blacklist: string[] }
   | { type: "getLog" };
 
 export type Response =
   | { type: "correctResult"; corrected: string | null }
-  | { type: "state"; paused: boolean; capitalize: boolean; blacklist: string[]; daemonUp: boolean | null }
+  | { type: "state"; paused: boolean; capitalize: boolean; blacklist: string[]; daemonUp: boolean | null; promptId: string; customSystem: string; customUser: string }
   | { type: "log"; entries: string[] };
 
 export interface LogEntry {

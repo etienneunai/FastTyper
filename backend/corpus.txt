@@ -1,0 +1,16 @@
+# FastTyper eval corpus (10 items). TEXT<TAB>EXPECTED.
+# PASS = whitespace-collapsed, case-insensitive EXPECTED is a substring of the corrected output.
+# Run:  ./backend/eval-corpus.sh -p E -t on -b 256 backend/corpus.txt
+# Expect 9/10 — item 7 (`youree`→`your`) is a known corpus ambiguity (the model
+# returns "you're"), not a real failure. Item 10 is scored against its full text
+# so any "improving" corruption of already-correct text flips it to FAIL.
+teh	the
+correctuobns	corrections
+poiint	point
+aupple	apple
+son much betternow	so much better now
+its working	it's working
+youree	your
+what a sahme	what a shame
+That is not what we want. It only makes those correctuobns after a bullet poiint. btw, still not working on new lines.	those corrections after a bullet point
+The quick brown fox jumps over the lazy dog.	The quick brown fox jumps over the lazy dog.

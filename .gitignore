@@ -1,0 +1,8 @@
+# Build artifacts
+obsidian-plugin/node_modules/
+
+# Runtime log (contains the user's typed text + LLM request/response payloads)
+llm-log.txt
+
+# LLM model weights — never committed; downloaded by backend/setup.fish to ~/.local/share/models/
+*.gguf

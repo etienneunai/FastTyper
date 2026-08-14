@@ -1,0 +1,16 @@
+.grammar-applied-underline {
+    text-decoration: underline wavy #3b82f6;
+    text-decoration-skip-ink: none;
+    background-color: rgba(59, 130, 246, 0.1);
+}
+
+.grammar-deletion-marker {
+    display: inline-block;
+    width: 2px;
+    height: 0.9em;
+    margin: 0 1px;
+    vertical-align: baseline;
+    background-color: #3b82f6;
+    opacity: 0.6;
+    border-radius: 1px;
+}

@@ -1,0 +1,21 @@
+{
+  "name": "fasttyper-obsidian",
+  "version": "1.0.0",
+  "description": "Real-time grammar correction using local LLM",
+  "main": "main.js",
+  "scripts": {
+    "dev": "node esbuild.config.mjs",
+    "build": "node esbuild.config.mjs production"
+  },
+  "devDependencies": {
+    "@codemirror/language": "^6.0.0",
+    "@codemirror/state": "^6.0.0",
+    "@codemirror/view": "^6.0.0",
+    "@types/node": "^18.0.0",
+    "builtin-modules": "^3.3.0",
+    "esbuild": "^0.17.0",
+    "obsidian": "latest",
+    "tslib": "^2.5.0",
+    "typescript": "^5.0.0"
+  }
+}

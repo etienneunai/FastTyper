@@ -1,0 +1,30 @@
+[Unit]
+Description=FastTyper Grammar Daemon (Llama Server Vulkan)
+After=network.target
+
+[Service]
+Type=simple
+Environment="AMD_VULKAN_ASYNC_COMPUTE=1"
+# Force 780M iGPU, ignoring CPU fallbacks and the 4060 dGPU.
+# NOTE: the ICD file on Arch/CachyOS is `radeon_icd.json` (no `.x86_64` suffix —
+# that's a Debian naming convention). A wrong path loads zero ICDs and silently
+# falls back to CPU.
+Environment="VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/radeon_icd.json"
+# -ngl 99: Offload all layers
+# -cb: Continuous batching
+# --split-mode none: Optimal for UMA iGPUs
+# -c 2048: Cap context (model default is 32k, wasteful on shared-memory iGPU)
+ExecStart=/usr/local/bin/llama-server \
+  -m %h/.local/share/models/dyslexic-writer-qwen3-4b-q4_k_m.gguf \
+  --port 8808 \
+  --host 127.0.0.1 \
+  -ngl 99 \
+  -cb \
+  --split-mode none \
+  -c 2048 \
+  --threads 4
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=default.target

@@ -521,8 +521,10 @@ var grammarCheckerPlugin = import_view.ViewPlugin.fromClass(class {
         break;
       clusterStart--;
     }
-    let from = para.from;
-    for (let i = clusterStart - 1; i >= para.from; i--) {
+    const line = doc.lineAt(triggerPos);
+    const hardStop = this.isListMarkerLine(line.text) ? line.from : para.from;
+    let from = hardStop;
+    for (let i = clusterStart - 1; i >= hardStop; i--) {
       const c = doc.sliceString(i, i + 1);
       if (c === "." || c === "?" || c === "!") {
         from = i + 1;
@@ -537,6 +539,11 @@ var grammarCheckerPlugin = import_view.ViewPlugin.fromClass(class {
       to++;
     }
     return { from, to };
+  }
+  /** True if the line begins a list item ("- ", "* ", "+ ", "1. ", "1) "). */
+  isListMarkerLine(lineText) {
+    const t = lineText.trimStart();
+    return /^[-*+]\s/.test(t) || /^\d+[.)]\s/.test(t);
   }
   /** The line completed by the newline at `triggerPos`. */
   lineSpan(triggerPos) {

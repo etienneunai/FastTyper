@@ -577,9 +577,16 @@ const grammarCheckerPlugin = ViewPlugin.fromClass(class {
             clusterStart--;
         }
 
-        // Scan back to the previous sentence terminator (or the paragraph start).
-        let from = para.from;
-        for (let i = clusterStart - 1; i >= para.from; i--) {
+        // A bullet point is a sentence delimiter: a `.`/`?`/`!` at the end of a
+        // list item must not swallow the whole list. Clamp the scan-back to the
+        // current line's start when that line is a list item, so the unit is just
+        // the one bullet (matching the newline trigger's per-line capture).
+        const line = doc.lineAt(triggerPos);
+        const hardStop = this.isListMarkerLine(line.text) ? line.from : para.from;
+
+        // Scan back to the previous sentence terminator (or the hard stop).
+        let from = hardStop;
+        for (let i = clusterStart - 1; i >= hardStop; i--) {
             const c = doc.sliceString(i, i + 1);
             if (c === '.' || c === '?' || c === '!') {
                 from = i + 1;
@@ -596,6 +603,12 @@ const grammarCheckerPlugin = ViewPlugin.fromClass(class {
         }
 
         return { from, to };
+    }
+
+    /** True if the line begins a list item ("- ", "* ", "+ ", "1. ", "1) "). */
+    private isListMarkerLine(lineText: string): boolean {
+        const t = lineText.trimStart();
+        return /^[-*+]\s/.test(t) || /^\d+[.)]\s/.test(t);
     }
 
     /** The line completed by the newline at `triggerPos`. */

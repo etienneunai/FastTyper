@@ -440,7 +440,15 @@ class Corrector {
   /** A trigger char (`.`, `?`, `!`, `\n`) was just inserted at `pos`. */
   verify(field: Field, pos: number, ch: string): void {
     if (paused) return;
-    if (this.verifyTimer) clearTimeout(this.verifyTimer);
+    if (this.verifyTimer) {
+      clearTimeout(this.verifyTimer);
+      this.verifyTimer = null;
+      // A new trigger landed before the old one confirmed. The old trigger char
+      // is still present (this input inserted, didn't delete), so confirm it NOW
+      // instead of dropping the completed unit — otherwise Enter Enter in a
+      // textarea loses the first line.
+      this.confirm();
+    }
     this.verifyPos = pos;
     this.verifyChar = ch;
     this.verifyField = field;

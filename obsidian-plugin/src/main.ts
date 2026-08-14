@@ -384,7 +384,15 @@ const grammarCheckerPlugin = ViewPlugin.fromClass(class {
         const trig = this.findTrigger(update);
         if (!trig) return;
 
-        if (this.verifyTimeout) clearTimeout(this.verifyTimeout);
+        if (this.verifyTimeout) {
+            clearTimeout(this.verifyTimeout);
+            this.verifyTimeout = null;
+            // A new trigger landed before the old one confirmed. The old trigger
+            // char is still present (this keystroke inserted, didn't delete), so
+            // confirm it NOW instead of losing the completed unit — otherwise
+            // pressing Enter twice to end a paragraph drops the first line.
+            this.confirmTrigger();
+        }
         this.verifyPos = trig.pos;
         this.verifyChar = trig.ch;
         this.verifyTimeout = setTimeout(() => this.confirmTrigger(), TRIGGER_VERIFY_MS);

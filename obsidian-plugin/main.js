@@ -37,6 +37,33 @@ var TRIGGER_VERIFY_MS = 100;
 var MAX_UNIT_CHARS = 800;
 var MIN_UNIT_CHARS = 3;
 var MAX_RETRIES = 3;
+var CUSTOM_PROMPT_ID = "custom";
+var PROMPT_PRESETS = [
+  {
+    id: "A",
+    name: "A \u2014 prod",
+    system: "You are a spelling correction assistant.",
+    user: "Fix any spelling mistakes in this text. If there are no mistakes, output the text unchanged.\n\n{text}"
+  },
+  {
+    id: "B",
+    name: "B \u2014 gram",
+    system: "You are a spelling and grammar correction assistant.",
+    user: "Fix any spelling mistakes, missing spaces, and a/an errors in this text. If there are no mistakes, output the text unchanged.\n\n{text}"
+  },
+  {
+    id: "E",
+    name: "E \u2014 proof",
+    system: "You are a careful proofreader.",
+    user: "Fix only clear errors: misspellings, run-together words, missing apostrophes, and a/an agreement. Never reword, restyle, or alter correct text. Reply with only the corrected text.\n\n{text}"
+  },
+  {
+    id: "C",
+    name: "C \u2014 clean",
+    system: "You are an English text cleaner.",
+    user: "Insert missing spaces between run-together words, fix spelling and a/an errors. Return only the corrected text.\n\n{text}"
+  }
+];
 var LLM_LOG_PATH = "/home/etienne/Projects/FastTyper/llm-log.txt";
 var ABBREVIATIONS = /* @__PURE__ */ new Set(["e.g.", "i.e.", "etc.", "Mr.", "Mrs.", "Ms.", "Dr.", "St.", "vs.", "no."]);
 var fsModule = null;
@@ -69,6 +96,15 @@ var revertCorrection = import_state.StateEffect.define();
 var clearCorrections = import_state.StateEffect.define();
 var correctionsPaused = false;
 var capitalizeInitials = true;
+var promptId = "A";
+var customSystem = PROMPT_PRESETS[0].system;
+var customUser = PROMPT_PRESETS[0].user;
+function activePrompt() {
+  var _a;
+  if (promptId === CUSTOM_PROMPT_ID)
+    return { system: customSystem, user: customUser };
+  return (_a = PROMPT_PRESETS.find((p) => p.id === promptId)) != null ? _a : PROMPT_PRESETS[0];
+}
 function correctionOf(value) {
   var _a, _b, _c;
   const spec = value.spec;
@@ -546,14 +582,20 @@ var grammarCheckerPlugin = import_view.ViewPlugin.fromClass(class {
   /** POST the unit to the daemon and return the corrected text (or null). */
   async request(text, signal) {
     var _a, _b, _c;
+    const { system, user } = activePrompt();
     const payload = {
       model: MODEL,
       messages: [
-        { role: "system", content: "You are a spelling correction assistant." },
-        { role: "user", content: "Fix any spelling mistakes in this text. If there are no mistakes, output the text unchanged.\n\n" + text }
+        { role: "system", content: system },
+        { role: "user", content: user.split("{text}").join(text) }
       ],
       temperature: 0,
-      max_tokens: Math.min(2048, Math.ceil(text.length / 3) + 256)
+      max_tokens: Math.min(2048, Math.ceil(text.length / 3) + 256),
+      // Force-disable Qwen3 thinking mode (template enable_thinking=false).
+      // Without this the model decides per-prompt and the proofreader/
+      // cleaner presets burn max_tokens on reasoning_content, returning
+      // empty output. Belt-and-suspenders with --reasoning off on the daemon.
+      chat_template_kwargs: { enable_thinking: false }
     };
     const body = JSON.stringify(payload);
     const response = await fetch(LLM_URL, {
@@ -617,6 +659,11 @@ var FastTyperSettingTab = class extends import_obsidian.PluginSettingTab {
     containerEl.empty();
     new import_obsidian.Setting(containerEl).setName("Pause corrections").setDesc("Stop triggering new corrections. Applied corrections stay until accepted or reverted.").addToggle((toggle) => toggle.setValue(correctionsPaused).onChange((value) => this.plugin.setPaused(value)));
     new import_obsidian.Setting(containerEl).setName("Capitalize sentence-initial letters").setDesc("Capitalize the first letter of each corrected sentence. Done deterministically in the plugin (the model is spelling-only and won't do it).").addToggle((toggle) => toggle.setValue(capitalizeInitials).onChange((value) => this.plugin.setCapitalizeInitials(value)));
+    new import_obsidian.Setting(containerEl).setName("Correction prompt").setDesc("Which prompt to send the model. A \u2014 prod: the default, spelling-only, never corrupts correct text. B \u2014 gram: adds missing spaces and a/an, keeps A's safety and speed. E \u2014 proof: most capable (a/an, apostrophes, run-together) but slow \u2014 emits a ~340-token reasoning block per request (6\u201325 s). C \u2014 clean: fixes a/an and run-together but unreliable (empty outputs, mid-sentence truncation) \u2014 a correction risk. Custom: edit both messages.").addDropdown((drop) => drop.addOption("A", "A \u2014 prod").addOption("B", "B \u2014 gram").addOption("E", "E \u2014 proof").addOption("C", "C \u2014 clean").addOption(CUSTOM_PROMPT_ID, "Custom").setValue(promptId).onChange((value) => this.plugin.setPromptId(value)));
+    if (promptId === CUSTOM_PROMPT_ID) {
+      new import_obsidian.Setting(containerEl).setName("Custom system prompt").setDesc("The system message sent with every request.").addTextArea((text) => text.setPlaceholder(PROMPT_PRESETS[0].system).setValue(customSystem).onChange((value) => this.plugin.setCustomSystem(value)));
+      new import_obsidian.Setting(containerEl).setName("Custom user prompt").setDesc("The user-message template. {text} is replaced with the sentence/line to correct.").addTextArea((text) => text.setPlaceholder(PROMPT_PRESETS[0].user).setValue(customUser).onChange((value) => this.plugin.setCustomUser(value)));
+    }
     new import_obsidian.Setting(containerEl).setName("Accept all corrections").setDesc("Commit every currently-applied correction and clear its underline.").addButton((button) => button.setButtonText("Accept all").setCta().onClick(() => this.plugin.acceptAll()));
   }
 };
@@ -632,6 +679,12 @@ var FastTyperPlugin = class extends import_obsidian.Plugin {
       correctionsPaused = true;
     if (typeof (data == null ? void 0 : data.capitalizeInitials) === "boolean")
       capitalizeInitials = data.capitalizeInitials;
+    if (typeof (data == null ? void 0 : data.promptId) === "string")
+      promptId = data.promptId;
+    if (typeof (data == null ? void 0 : data.customSystem) === "string")
+      customSystem = data.customSystem;
+    if (typeof (data == null ? void 0 : data.customUser) === "string")
+      customUser = data.customUser;
     this.addCommand({
       id: "accept-all-corrections",
       name: "Accept all corrections",
@@ -677,9 +730,26 @@ var FastTyperPlugin = class extends import_obsidian.Plugin {
     await this.saveSettings();
     (_a = this.settingsTab) == null ? void 0 : _a.display();
   }
+  /** Select the active prompt preset (`A`/`B`/`E`/`C`/`custom`) and persist. */
+  async setPromptId(id) {
+    var _a;
+    promptId = id;
+    await this.saveSettings();
+    (_a = this.settingsTab) == null ? void 0 : _a.display();
+  }
+  /** Set the custom system message (used with the Custom prompt) and persist. */
+  async setCustomSystem(value) {
+    customSystem = value;
+    await this.saveSettings();
+  }
+  /** Set the custom user template (used with the Custom prompt) and persist. */
+  async setCustomUser(value) {
+    customUser = value;
+    await this.saveSettings();
+  }
   /** Persist the current settings to plugin data. */
   async saveSettings() {
-    await this.saveData({ paused: correctionsPaused, capitalizeInitials });
+    await this.saveData({ paused: correctionsPaused, capitalizeInitials, promptId, customSystem, customUser });
   }
   /** Push the current pause state to every open editor's corrector instance. */
   applyPauseState() {

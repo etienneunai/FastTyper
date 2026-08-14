@@ -151,6 +151,9 @@ export function buildPayload(text: string): Record<string, unknown> {
     ],
     temperature: 0,
     max_tokens: Math.min(2048, Math.ceil(text.length / 3) + 256),
+    // Force-disable Qwen3 thinking mode (template enable_thinking=false).
+    // Keep in sync with obsidian-plugin/src/main.ts request().
+    chat_template_kwargs: { enable_thinking: false },
   };
 }
 

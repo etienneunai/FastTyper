@@ -19,6 +19,11 @@ Environment="LD_LIBRARY_PATH=/usr/local/lib"
 # -cb: Continuous batching
 # --split-mode none: Optimal for UMA iGPUs
 # -c 2048: Cap context (model default is 32k, wasteful on shared-memory iGPU)
+# --reasoning off: Force-disable Qwen3 thinking mode (equivalent to template
+#   enable_thinking=false, which emits an empty <think></think> marker). Qwen3
+#   thinks by default and decides per prompt — the "proofreader"/"cleaner"
+#   presets burn the whole max_tokens budget on reasoning_content and return
+#   empty output (see llm-log.txt). This makes the model answer directly.
 ExecStart=/usr/local/bin/llama-server \
   -m %h/.local/share/models/dyslexic-writer-qwen3-4b-q4_k_m.gguf \
   --port 8808 \
@@ -27,6 +32,7 @@ ExecStart=/usr/local/bin/llama-server \
   -cb \
   --split-mode none \
   -c 2048 \
+  --reasoning off \
   --threads 4
 Restart=always
 RestartSec=3

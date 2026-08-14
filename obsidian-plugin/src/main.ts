@@ -27,6 +27,43 @@ const MIN_UNIT_CHARS = 3;
 /** Max times we re-send a unit that changed while the request was in flight. */
 const MAX_RETRIES = 3;
 
+/** A selectable prompt preset: system message + user-message template (`{text}` → unit text). */
+interface PromptPreset {
+    id: string;
+    name: string;
+    system: string;
+    user: string;
+}
+
+const CUSTOM_PROMPT_ID = "custom";
+
+const PROMPT_PRESETS: PromptPreset[] = [
+    {
+        id: "A",
+        name: "A — prod",
+        system: "You are a spelling correction assistant.",
+        user: "Fix any spelling mistakes in this text. If there are no mistakes, output the text unchanged.\n\n{text}"
+    },
+    {
+        id: "B",
+        name: "B — gram",
+        system: "You are a spelling and grammar correction assistant.",
+        user: "Fix any spelling mistakes, missing spaces, and a/an errors in this text. If there are no mistakes, output the text unchanged.\n\n{text}"
+    },
+    {
+        id: "E",
+        name: "E — proof",
+        system: "You are a careful proofreader.",
+        user: "Fix only clear errors: misspellings, run-together words, missing apostrophes, and a/an agreement. Never reword, restyle, or alter correct text. Reply with only the corrected text.\n\n{text}"
+    },
+    {
+        id: "C",
+        name: "C — clean",
+        system: "You are an English text cleaner.",
+        user: "Insert missing spaces between run-together words, fix spelling and a/an errors. Return only the corrected text.\n\n{text}"
+    }
+];
+
 /** Absolute path to the LLM exchange log (FastTyper repo root). */
 const LLM_LOG_PATH = "/home/etienne/Projects/FastTyper/llm-log.txt";
 
@@ -60,6 +97,18 @@ export const clearCorrections = StateEffect.define<null>();
 let correctionsPaused = false;
 /** When true, capitalize the first letter of each corrected sentence (deterministic — the model won't). */
 let capitalizeInitials = true;
+/** Active prompt preset id (`PROMPT_PRESETS[i].id` or `CUSTOM_PROMPT_ID`). */
+let promptId = "A";
+/** Custom system message (used when `promptId === CUSTOM_PROMPT_ID`). */
+let customSystem = PROMPT_PRESETS[0].system;
+/** Custom user-message template with `{text}` (used when `promptId === CUSTOM_PROMPT_ID`). */
+let customUser = PROMPT_PRESETS[0].user;
+
+/** The active system message + user template pair, from the selected preset or the custom fields. */
+function activePrompt(): { system: string; user: string } {
+    if (promptId === CUSTOM_PROMPT_ID) return { system: customSystem, user: customUser };
+    return PROMPT_PRESETS.find(p => p.id === promptId) ?? PROMPT_PRESETS[0];
+}
 
 /** Read the correction metadata off a mark or a deletion-widget decoration. */
 function correctionOf(value: Decoration): AppliedCorrection | null {
@@ -556,14 +605,20 @@ const grammarCheckerPlugin = ViewPlugin.fromClass(class {
 
     /** POST the unit to the daemon and return the corrected text (or null). */
     private async request(text: string, signal: AbortSignal): Promise<string | null> {
+        const { system, user } = activePrompt();
         const payload = {
             model: MODEL,
             messages: [
-                { role: "system", content: "You are a spelling correction assistant." },
-                { role: "user", content: "Fix any spelling mistakes in this text. If there are no mistakes, output the text unchanged.\n\n" + text }
+                { role: "system", content: system },
+                { role: "user", content: user.split("{text}").join(text) }
             ],
             temperature: 0,
-            max_tokens: Math.min(2048, Math.ceil(text.length / 3) + 256)
+            max_tokens: Math.min(2048, Math.ceil(text.length / 3) + 256),
+            // Force-disable Qwen3 thinking mode (template enable_thinking=false).
+            // Without this the model decides per-prompt and the proofreader/
+            // cleaner presets burn max_tokens on reasoning_content, returning
+            // empty output. Belt-and-suspenders with --reasoning off on the daemon.
+            chat_template_kwargs: { enable_thinking: false }
         };
         const body = JSON.stringify(payload);
 
@@ -650,6 +705,35 @@ class FastTyperSettingTab extends PluginSettingTab {
                 .onChange(value => this.plugin.setCapitalizeInitials(value)));
 
         new Setting(containerEl)
+            .setName("Correction prompt")
+            .setDesc("Which prompt to send the model. A — prod: the default, spelling-only, never corrupts correct text. B — gram: adds missing spaces and a/an, keeps A's safety and speed. E — proof: most capable (a/an, apostrophes, run-together) but slow — emits a ~340-token reasoning block per request (6–25 s). C — clean: fixes a/an and run-together but unreliable (empty outputs, mid-sentence truncation) — a correction risk. Custom: edit both messages.")
+            .addDropdown(drop => drop
+                .addOption("A", "A — prod")
+                .addOption("B", "B — gram")
+                .addOption("E", "E — proof")
+                .addOption("C", "C — clean")
+                .addOption(CUSTOM_PROMPT_ID, "Custom")
+                .setValue(promptId)
+                .onChange(value => this.plugin.setPromptId(value)));
+
+        if (promptId === CUSTOM_PROMPT_ID) {
+            new Setting(containerEl)
+                .setName("Custom system prompt")
+                .setDesc("The system message sent with every request.")
+                .addTextArea(text => text
+                    .setPlaceholder(PROMPT_PRESETS[0].system)
+                    .setValue(customSystem)
+                    .onChange(value => this.plugin.setCustomSystem(value)));
+            new Setting(containerEl)
+                .setName("Custom user prompt")
+                .setDesc("The user-message template. {text} is replaced with the sentence/line to correct.")
+                .addTextArea(text => text
+                    .setPlaceholder(PROMPT_PRESETS[0].user)
+                    .setValue(customUser)
+                    .onChange(value => this.plugin.setCustomUser(value)));
+        }
+
+        new Setting(containerEl)
             .setName("Accept all corrections")
             .setDesc("Commit every currently-applied correction and clear its underline.")
             .addButton(button => button
@@ -667,6 +751,9 @@ export default class FastTyperPlugin extends Plugin {
         const data = await this.loadData();
         if (data?.paused) correctionsPaused = true;
         if (typeof data?.capitalizeInitials === "boolean") capitalizeInitials = data.capitalizeInitials;
+        if (typeof data?.promptId === "string") promptId = data.promptId;
+        if (typeof data?.customSystem === "string") customSystem = data.customSystem;
+        if (typeof data?.customUser === "string") customUser = data.customUser;
 
         this.addCommand({
             id: "accept-all-corrections",
@@ -720,9 +807,28 @@ export default class FastTyperPlugin extends Plugin {
         this.settingsTab?.display();
     }
 
+    /** Select the active prompt preset (`A`/`B`/`E`/`C`/`custom`) and persist. */
+    async setPromptId(id: string) {
+        promptId = id;
+        await this.saveSettings();
+        this.settingsTab?.display();
+    }
+
+    /** Set the custom system message (used with the Custom prompt) and persist. */
+    async setCustomSystem(value: string) {
+        customSystem = value;
+        await this.saveSettings();
+    }
+
+    /** Set the custom user template (used with the Custom prompt) and persist. */
+    async setCustomUser(value: string) {
+        customUser = value;
+        await this.saveSettings();
+    }
+
     /** Persist the current settings to plugin data. */
     private async saveSettings() {
-        await this.saveData({ paused: correctionsPaused, capitalizeInitials });
+        await this.saveData({ paused: correctionsPaused, capitalizeInitials, promptId, customSystem, customUser });
     }
 
     /** Push the current pause state to every open editor's corrector instance. */

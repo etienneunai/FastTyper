@@ -15,8 +15,6 @@ export const TRIGGER_VERIFY_MS = 100;
 /** Skip units longer than this (sentences are short; keeps the 4B model's latency sane). */
 export const MAX_UNIT_CHARS = 800;
 export const MIN_UNIT_CHARS = 3;
-/** Max times we re-send a unit that changed while the request was in flight. */
-export const MAX_RETRIES = 3;
 
 /** Common abbreviations whose trailing period is not a sentence end. */
 export const ABBREVIATIONS = new Set([
@@ -166,11 +164,12 @@ export type Request =
   | { type: "getState" }
   | { type: "setPaused"; paused: boolean }
   | { type: "setCapitalize"; value: boolean }
+  | { type: "setBlacklist"; blacklist: string[] }
   | { type: "getLog" };
 
 export type Response =
   | { type: "correctResult"; corrected: string | null }
-  | { type: "state"; paused: boolean; capitalize: boolean; daemonUp: boolean | null }
+  | { type: "state"; paused: boolean; capitalize: boolean; blacklist: string[]; daemonUp: boolean | null }
   | { type: "log"; entries: string[] };
 
 export interface LogEntry {
@@ -182,5 +181,5 @@ export interface LogEntry {
 
 /** Push-to-content-script settings/command messages (not request/response). */
 export type PushMsg =
-  | { type: "settings"; paused: boolean; capitalize: boolean }
+  | { type: "settings"; paused: boolean; capitalize: boolean; blacklist: string[] }
   | { type: "acceptAll" };

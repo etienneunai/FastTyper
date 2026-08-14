@@ -94,13 +94,17 @@ to the same `127.0.0.1:8808` daemon, so **no backend changes are needed**.
   contenteditable editors (e.g. GitHub comments, email composers, CMS editors).
 - **Where it's disabled**: password/login/username fields, Google Docs
   (canvas-rendered), and mirrored-hidden-textarea editors (CodeMirror, Monaco,
-  Notion-style) — their visible text isn't DOM text.
+  Notion-style) — their visible text isn't DOM text. You can also blacklist
+  whole sites (exact hostname or any subdomain) from the popup.
 - **Revert**: in contenteditable editors, corrections get a wavy underline and a
   hover → click-to-revert tooltip (and Ctrl+Z works, since edits go through
-  `execCommand`). Plain textareas can't show inline markup, so those show a
-  transient pill near the field with an Undo button.
+  `execCommand`). Plain textareas can't show inline markup, so each correction
+  shows a transient pill with the corrected sentence, every changed word shown
+  as `was → now`, and one Undo button that reverts all of them.
 - **Controls**: toolbar popup (pause, capitalize-sentence-initials, accept-all,
-  daemon status, recent-exchange log) plus a `Ctrl+Shift+F` pause shortcut.
+  site blacklist, daemon status, recent-exchange log) plus a `Ctrl+Shift+F`
+  pause shortcut. If you edit a corrected sentence again, it isn't re-corrected
+  over your typing.
 - **Logging**: browser extensions have no filesystem access, so the exchange log
   lives in `storage.local` (last 50) and is viewable in the popup, rather than
   `llm-log.txt`.

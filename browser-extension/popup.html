@@ -10,6 +10,9 @@
   <label class="row"><input type="checkbox" id="capitalize"> Capitalize sentence-initial letters</label>
   <button id="acceptAll" class="btn">Accept all corrections</button>
   <div id="status" class="status">Daemon: checking…</div>
+  <label for="blacklist" class="bl-label">Skip corrections on these sites (one per line)</label>
+  <textarea id="blacklist" rows="3" placeholder="example.com&#10;docs.google.com"></textarea>
+  <button id="saveBlacklist" class="btn">Save blacklist</button>
   <details id="logWrap">
     <summary>LLM exchange log</summary>
     <pre id="log"></pre>

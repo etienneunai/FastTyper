@@ -8,6 +8,7 @@ async function refresh(): Promise<void> {
   if (st.type !== "state") return;
   ($("paused") as HTMLInputElement).checked = st.paused;
   ($("capitalize") as HTMLInputElement).checked = st.capitalize;
+  ($("blacklist") as HTMLTextAreaElement).value = (st.blacklist ?? []).join("\n");
   const status = $("status");
   status.textContent =
     st.daemonUp === true
@@ -26,6 +27,11 @@ async function refresh(): Promise<void> {
 });
 $("acceptAll").addEventListener("click", () => {
   void browser.runtime.sendMessage({ type: "acceptAll" });
+});
+$("saveBlacklist").addEventListener("click", () => {
+  const raw = ($("blacklist") as HTMLTextAreaElement).value;
+  const list = raw.split("\n").map((s) => s.trim()).filter(Boolean);
+  void browser.runtime.sendMessage({ type: "setBlacklist", blacklist: list });
 });
 $("logWrap").addEventListener("toggle", () => {
   void browser.runtime.sendMessage({ type: "getLog" }).then((r) => {

@@ -13,13 +13,15 @@
  *   undo works) and the changed text is wrapped in an `ft-correction` span with
  *   a hover → click-to-revert tooltip.
  * - Plain deletions (zero-width hunks) apply but get no marker in v1.
- * - Spans are not mapped through subsequent edits; on conflict the unit is
- *   re-sent (≤ MAX_RETRIES) like the plugin, using the same offsets.
+ * - Spans are not mapped through subsequent edits; if the unit changed while
+ *   the request was in flight the correction is abandoned — stale text is never
+ *   inserted. Units overlapping an already-applied correction are skipped too,
+ *   so editing a corrected sentence again won't re-trigger a substitution.
  * - Google Docs (and similar canvas/mirrored-textarea editors: CodeMirror,
  *   Monaco, Notion-style) are skipped — their visible text isn't DOM text.
  */
 import {
-  TRIGGER_VERIFY_MS, MAX_UNIT_CHARS, MIN_UNIT_CHARS, MAX_RETRIES, ABBREVIATIONS,
+  TRIGGER_VERIFY_MS, MAX_UNIT_CHARS, MIN_UNIT_CHARS, ABBREVIATIONS,
   diffWords, capitalizeInitial, contextSnippet,
   type DiffHunk, type PushMsg,
 } from "./shared";
@@ -34,20 +36,49 @@ if (/(^|\.)docs\.google\.com$/.test(location.hostname)) {
 // ---------------------------------------------------------------------------
 let paused = false;
 let capitalize = true;
+/** Hostnames (or subdomains of them) where FastTyper is disabled. */
+let blacklist: string[] = [];
+/** True when the current page's hostname is blacklisted. */
+let siteDisabled = false;
+
+function matchesBlacklist(hostname: string): boolean {
+  const h = hostname.toLowerCase();
+  return blacklist.some((e) => {
+    const entry = e.trim().toLowerCase();
+    return h === entry || h.endsWith("." + entry);
+  });
+}
+
+/** Enable/disable the script on this page based on the blacklist. */
+function applySiteState(): void {
+  const disabled = matchesBlacklist(location.hostname);
+  if (disabled && !siteDisabled) {
+    siteDisabled = true;
+    corrector.reset();
+    active = null;
+    dismissAllPills();
+  } else if (!disabled) {
+    siteDisabled = false;
+  }
+}
 
 browser.storage.local.get("settings").then((got) => {
-  const s = got.settings as { paused?: boolean; capitalize?: boolean } | undefined;
+  const s = got.settings as { paused?: boolean; capitalize?: boolean; blacklist?: string[] } | undefined;
   if (s) {
     paused = !!s.paused;
     capitalize = s.capitalize !== false;
+    if (Array.isArray(s.blacklist)) blacklist = s.blacklist;
   }
+  applySiteState();
 });
 
 browser.runtime.onMessage.addListener((msg: PushMsg) => {
   if (msg.type === "settings") {
     paused = msg.paused;
     capitalize = msg.capitalize;
+    if (Array.isArray(msg.blacklist)) blacklist = msg.blacklist;
     if (paused) corrector.reset();
+    applySiteState();
   } else if (msg.type === "acceptAll") {
     acceptAll();
   }
@@ -66,10 +97,8 @@ interface Field {
   /** Paragraph/block containing `pos`, as text() offsets. */
   blockStart(pos: number): number;
   blockEnd(pos: number): number;
-  /** Replace [from,to) with `insert`. Returns the inserted text node (contenteditable) + post-caret. */
-  replace(from: number, to: number, insert: string): { node: Text | null; caretAfter: number };
-  /** Wrap an existing text node in an ft-correction span (null if not possible). */
-  wrapNode(node: Text): HTMLElement | null;
+  /** Replace [from,to) with `insert`, returning the post-replacement caret. */
+  replace(from: number, to: number, insert: string): number;
   /** Set the whole value (textarea path), firing an (untrusted) input event. */
   setValue(v: string): void;
 }
@@ -132,10 +161,8 @@ class SimpleField implements Field {
     this.setValue(next);
     const caretAfter = from + insert.length;
     this.setCaret(caretAfter);
-    return { node: null as Text | null, caretAfter };
+    return caretAfter;
   }
-
-  wrapNode(): HTMLElement | null { return null; }
 
   setValue(v: string): void {
     const el = this.el as HTMLTextAreaElement | HTMLInputElement;
@@ -293,45 +320,14 @@ class ContentEditableField implements Field {
       range.deleteContents();
       if (insert) range.insertNode(document.createTextNode(insert));
     }
-
-    const caretAfter = from + insert.length;
-    const fresh = this.model();
-    // The inserted text is the single text node covering position caretAfter-1.
-    const node = this.textNodeAt(fresh, Math.max(0, caretAfter - 1));
     // NOTE: the caret is NOT set here — execCommand parked it at the inserted
     // text, and applyHunks() restores the user's real position afterwards.
-    return { node, caretAfter };
-  }
-
-  wrapNode(node: Text): HTMLElement | null {
-    if (!node.parentNode) return null;
-    const range = document.createRange();
-    range.setStart(node, 0);
-    range.setEnd(node, node.data.length);
-    const span = document.createElement("span");
-    span.className = "ft-correction";
-    try {
-      range.surroundContents(span);
-      return span;
-    } catch {
-      return null;
-    }
+    return from + insert.length;
   }
 
   setValue(v: string): void {
     // Not used for contenteditable (corrections are applied per-range).
     void v;
-  }
-
-  private textNodeAt(model: ContentModel, pos: number): Text | null {
-    if (model.texts.length === 0) return null;
-    const idx = upperBound(model.starts, pos) - 1;
-    if (idx < 0) return model.texts[0];
-    const n = model.texts[idx];
-    if (pos - model.starts[idx] >= n.data.length) {
-      return model.texts[idx + 1] ?? n;
-    }
-    return n;
   }
 }
 
@@ -482,6 +478,10 @@ class Corrector {
     if (unit.trim().length < MIN_UNIT_CHARS) return;
     if (looksLikeCode(unit)) return;
 
+    // If the unit overlaps an already-applied (still-active) correction, the
+    // user is editing the corrected text — don't substitute over it again.
+    if (hasAppliedOverlap(field, span.from, span.to)) return;
+
     this.queued = { field, from: span.from, to: span.to };
     this.maybeFire();
   }
@@ -497,33 +497,26 @@ class Corrector {
     this.isPending = true;
     const g = this.gen;
     try {
-      for (let retries = 0; retries <= MAX_RETRIES; retries++) {
-        if (this.gen !== g || paused || active !== q.field) return;
-        const text = q.field.readText();
-        const raw = text.slice(q.from, q.to);
-        const trimmed = raw.trim();
-        const lead = raw.length - raw.trimStart().length;
-        if (trimmed.length < MIN_UNIT_CHARS) return;
-        if (looksLikeCode(trimmed)) return;
+      if (this.gen !== g || paused || active !== q.field) return;
+      const text = q.field.readText();
+      const raw = text.slice(q.from, q.to);
+      const trimmed = raw.trim();
+      const lead = raw.length - raw.trimStart().length;
+      if (trimmed.length < MIN_UNIT_CHARS) return;
+      if (looksLikeCode(trimmed)) return;
 
-        const corrected = await this.request(trimmed);
-        if (this.gen !== g || paused || active !== q.field) return;
-        if (!corrected) return;
+      const corrected = await this.request(trimmed);
+      if (this.gen !== g || paused || active !== q.field) return;
+      if (!corrected) return;
 
-        const final = capitalizeInitial(corrected, capitalize);
-        if (final === trimmed) return;
+      const final = capitalizeInitial(corrected, capitalize);
+      if (final === trimmed) return;
 
-        const nowText = q.field.readText();
-        if (nowText.slice(q.from, q.to).trim() !== trimmed) {
-          // The user edited the unit while we waited — resend the new text.
-          if (retries < MAX_RETRIES) continue;
-          return;
-        }
+      // The user edited the unit while we waited — never insert stale text.
+      if (q.field.readText().slice(q.from, q.to).trim() !== trimmed) return;
 
-        const hunks = diffWords(trimmed, final);
-        if (hunks.length > 0) applyHunks(q.field, q.from, lead, hunks);
-        return;
-      }
+      const hunks = diffWords(trimmed, final);
+      if (hunks.length > 0) applyHunks(q.field, q.from, lead, trimmed, hunks);
     } finally {
       this.isPending = false;
       this.queued = null;
@@ -566,23 +559,126 @@ function mapCaret(caret: number, changes: { from: number; to: number; ins: strin
   return c;
 }
 
-function applyHunks(field: Field, spanStart: number, lead: number, hunks: DiffHunk[]): void {
+/** Wrap a text node in a marker span (keeps its text; the span is the marker). */
+function wrapTextNode(node: Text, className: string): HTMLElement | null {
+  if (!node.parentNode) return null;
+  const span = document.createElement("span");
+  span.className = className;
+  try {
+    node.parentNode.insertBefore(span, node);
+    span.appendChild(node);
+    return span;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Wrap exactly the text range [from, to) of a contenteditable in a marker span,
+ * splitting text nodes at the boundaries so ONLY that range is marked.
+ * Returns null if the range can't be isolated (e.g. it crosses an element).
+ */
+function wrapRange(root: HTMLElement, from: number, to: number, className: string): HTMLElement | null {
+  const model = buildModel(root);
+  if (model.texts.length === 0 || from < 0 || to > model.text.length || from >= to) return null;
+  const range = modelRange(model, from, to);
+  const sc = range.startContainer;
+  const ec = range.endContainer;
+  const so = range.startOffset;
+  const eo = range.endOffset;
+
+  // Single text node: split out exactly [a, b) and wrap that.
+  if (sc.nodeType === Node.TEXT_NODE && ec.nodeType === Node.TEXT_NODE && sc === ec) {
+    const t = sc as Text;
+    const a = so, b = eo;
+    if (a > 0) {
+      const mid = t.splitText(a);
+      if (b - a < mid.data.length) mid.splitText(b - a);
+      return wrapTextNode(mid, className);
+    }
+    if (b < t.data.length) t.splitText(b);
+    return wrapTextNode(t, className);
+  }
+
+  // Cross text nodes: only wrap if they're contiguous text siblings.
+  if (sc.nodeType === Node.TEXT_NODE && ec.nodeType === Node.TEXT_NODE && sc !== ec) {
+    const startNode = so > 0 ? (sc as Text).splitText(so) : (sc as Text);
+    let endNode = ec as Text;
+    if (eo > 0 && eo < endNode.data.length) endNode.splitText(eo); // endNode keeps [0, eo)
+    let n: Node | null = startNode.nextSibling;
+    while (n && n !== endNode) {
+      if (n.nodeType !== Node.TEXT_NODE) return null;
+      n = n.nextSibling;
+    }
+    if (!n) return null;
+    const span = document.createElement("span");
+    span.className = className;
+    try {
+      const r = document.createRange();
+      r.setStart(startNode, 0);
+      r.setEnd(endNode, eo > endNode.data.length ? endNode.data.length : eo);
+      r.surroundContents(span);
+      return span;
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
+
+/** Textarea applied ranges (approximate offsets), keyed by field element, for the re-correction guard. */
+const textApplied = new Map<HTMLElement, { from: number; to: number }[]>();
+
+function registerTextApplied(field: Field, ranges: { from: number; to: number }[]): void {
+  const el = field.el;
+  const list = textApplied.get(el) ?? [];
+  list.push(...ranges);
+  textApplied.set(el, list);
+}
+
+function unregisterTextApplied(field: Field, ranges: { from: number; to: number }[]): void {
+  const el = field.el;
+  const list = textApplied.get(el);
+  if (!list) return;
+  const dropped = new Set(ranges);
+  const remaining = list.filter((r) => !dropped.has(r));
+  if (remaining.length === 0) textApplied.delete(el);
+  else textApplied.set(el, remaining);
+}
+
+/** True if the unit [from,to) overlaps an active (un-accepted) correction in this field. */
+function hasAppliedOverlap(field: Field, from: number, to: number): boolean {
+  if (field.kind === "contenteditable") {
+    const model = buildModel(field.el);
+    for (const d of decos) {
+      if (!field.el.contains(d.span)) continue;
+      const tn = d.span.firstChild;
+      if (!tn || tn.nodeType !== Node.TEXT_NODE) continue;
+      const idx = model.texts.indexOf(tn as Text);
+      if (idx === -1) continue;
+      const df = model.starts[idx];
+      const dt = df + (tn as Text).data.length;
+      if (df < to && dt > from) return true;
+    }
+    return false;
+  }
+  const list = textApplied.get(field.el);
+  return !!list && list.some((r) => r.from < to && r.to > from);
+}
+
+function applyHunks(field: Field, spanStart: number, lead: number, trimmed: string, hunks: DiffHunk[]): void {
   const base = spanStart + lead;
   if (field.kind === "textarea") {
     const text = field.readText();
     const changes = hunks.map((h) => ({ from: base + h.from, to: base + h.to, ins: h.replacement }));
-    // Record what each hunk replaces BEFORE mutating.
-    const applied = changes.map((c) => ({ from: c.from, to: c.to, original: text.slice(c.from, c.to), ins: c.ins }));
     const caretBefore = field.caret();
     let v = text;
     for (const c of [...changes].sort((a, b) => b.from - a.from)) {
       v = v.slice(0, c.from) + c.ins + v.slice(c.to);
     }
     field.setValue(v);
-    for (const a of applied) {
-      if (a.original !== a.ins) showTextareaPill(field, a.from, a.original, a.ins);
-    }
     field.setCaret(mapCaret(caretBefore, changes));
+    showCorrectionPill(field, base, trimmed, hunks);
     return;
   }
 
@@ -596,10 +692,12 @@ function applyHunks(field: Field, spanStart: number, lead: number, hunks: DiffHu
     const ins = h.replacement;
     const original = text.slice(from, to);
     const snippet = contextSnippet(text, from, to, original, ins);
-    const res = field.replace(from, to, ins);
+    field.replace(from, to, ins);
     changes.push({ from, to, ins });
-    if (res.node && ins !== "") {
-      const span = field.wrapNode(res.node);
+    // execCommand merges inserted text into its containing text node, so locate
+    // the exact [from, from+ins.length) range and wrap ONLY that.
+    if (ins !== "") {
+      const span = wrapRange(field.el, from, from + ins.length, "ft-correction");
       if (span) {
         span.title = "FastTyper correction";
         addTooltip(span);
@@ -630,35 +728,82 @@ function acceptAll(): void {
     d.span.replaceWith(...Array.from(d.span.childNodes));
   }
   decos.length = 0;
+  textApplied.clear();
   hideTooltip();
   dismissAllPills();
 }
 
 // --- textarea indicator pills ---
-interface Pill { el: HTMLElement; field: Field; from: number; original: string; replacement: string; timer: ReturnType<typeof setTimeout>; }
+interface Pill {
+  el: HTMLElement;
+  field: Field;
+  undoHunks: { from: number; len: number; original: string; ins: string }[];
+  appliedRanges: { from: number; to: number }[];
+  timer: ReturnType<typeof setTimeout>;
+}
 const pills: Pill[] = [];
 
-function showTextareaPill(field: Field, from: number, original: string, replacement: string): void {
+/** The corrected sentence, with each changed word shown as `was → now`. */
+function buildHighlighted(trimmed: string, hunks: DiffHunk[]): HTMLElement {
+  const body = document.createElement("div");
+  body.className = "ft-pill-body";
+  let pos = 0;
+  for (const h of hunks) {
+    if (h.from > pos) body.appendChild(document.createTextNode(trimmed.slice(pos, h.from)));
+    const mark = document.createElement("span");
+    mark.className = "ft-pill-change";
+    const was = document.createElement("span");
+    was.className = "ft-pill-was";
+    was.textContent = trimmed.slice(h.from, h.to) || "∅";
+    const arrow = document.createTextNode(" → ");
+    const now = document.createElement("span");
+    now.className = "ft-pill-now";
+    now.textContent = h.replacement;
+    mark.append(was, arrow, now);
+    body.appendChild(mark);
+    pos = h.to;
+  }
+  if (pos < trimmed.length) body.appendChild(document.createTextNode(trimmed.slice(pos)));
+  return body;
+}
+
+/** One pill per correction event, aggregating every hunk in the sentence. */
+function showCorrectionPill(field: Field, base: number, trimmed: string, hunks: DiffHunk[]): void {
   const pill = document.createElement("div");
   pill.className = "ft-pill";
-  pill.textContent = `FastTyper: "${original}" → "${replacement}"`;
+  pill.appendChild(buildHighlighted(trimmed, hunks));
 
+  const row = document.createElement("div");
+  row.className = "ft-pill-row";
   const undo = document.createElement("button");
   undo.className = "ft-pill-btn";
-  undo.textContent = "Undo";
+  undo.textContent = hunks.length > 1 ? `Undo (${hunks.length})` : "Undo";
   undo.addEventListener("click", () => undoPill(pill));
-  pill.appendChild(undo);
-
+  row.appendChild(undo);
   const dismiss = document.createElement("button");
-  dismiss.className = "ft-pill-btn";
+  dismiss.className = "ft-pill-btn ft-pill-x";
   dismiss.textContent = "×";
+  dismiss.title = "Dismiss (correction stays applied)";
   dismiss.addEventListener("click", () => removePill(pill));
-  pill.appendChild(dismiss);
+  row.appendChild(dismiss);
+  pill.appendChild(row);
 
   document.body.appendChild(pill);
+
+  // Record the applied range (guard against re-correcting while editing) and
+  // the reverse hunks (undo), all in post-apply field coordinates.
+  const appliedRanges = hunks.map((h) => ({ from: base + h.from, to: base + h.to }));
+  const undoHunks = hunks.map((h) => ({
+    from: base + h.from,
+    len: h.replacement.length,
+    original: trimmed.slice(h.from, h.to),
+    ins: h.replacement,
+  }));
+  registerTextApplied(field, appliedRanges);
+
   positionPill(pill, field.el);
-  const timer = setTimeout(() => removePill(pill), 6000);
-  pills.push({ el: pill, field, from, original, replacement, timer });
+  const timer = setTimeout(() => removePill(pill), 8000);
+  pills.push({ el: pill, field, undoHunks, appliedRanges, timer });
 }
 
 function positionPill(pill: HTMLElement, anchor: HTMLElement): void {
@@ -666,6 +811,13 @@ function positionPill(pill: HTMLElement, anchor: HTMLElement): void {
   const pr = pill.getBoundingClientRect();
   let left = r.left;
   let top = r.bottom + 6;
+  // Stack below any other pill anchored to the same field.
+  for (const p of pills) {
+    if (p.el === pill) continue;
+    if (p.field.el !== anchor) continue;
+    const pr2 = p.el.getBoundingClientRect();
+    top = Math.max(top, pr2.bottom + 4);
+  }
   if (left + pr.width > window.innerWidth - 8) left = Math.max(8, window.innerWidth - pr.width - 8);
   if (top + pr.height > window.innerHeight - 8) top = Math.max(8, r.top - pr.height - 6);
   pill.style.left = `${left}px`;
@@ -680,17 +832,26 @@ function removePill(pill: HTMLElement): void {
   pill.remove();
 }
 
+/** Revert every hunk this pill reported (skips hunks the user already edited). */
 function undoPill(pill: HTMLElement): void {
   const idx = pills.findIndex((p) => p.el === pill);
   if (idx === -1) return;
   const p = pills[idx];
   const v = p.field.readText();
-  // Re-locate the replacement near where it was applied (or anywhere).
-  const searchFrom = Math.max(0, p.from - 2);
-  const at = v.indexOf(p.replacement, searchFrom);
-  if (at !== -1 && v.slice(at, at + p.replacement.length) === p.replacement) {
-    p.field.replace(at, at + p.replacement.length, p.original);
+  const caretBefore = p.field.caret();
+  const changes: { from: number; to: number; ins: string }[] = [];
+  let nv = v;
+  for (const u of [...p.undoHunks].sort((a, b) => b.from - a.from)) {
+    if (nv.slice(u.from, u.from + u.len) === u.ins) {
+      nv = nv.slice(0, u.from) + u.original + nv.slice(u.from + u.len);
+      changes.push({ from: u.from, to: u.from + u.len, ins: u.original });
+    }
   }
+  if (changes.length > 0) {
+    p.field.setValue(nv);
+    p.field.setCaret(mapCaret(caretBefore, changes));
+  }
+  unregisterTextApplied(p.field, p.appliedRanges);
   removePill(pill);
 }
 
@@ -764,6 +925,7 @@ function onFocusIn(el: HTMLElement): void {
 let pendingInsert: { caretBefore: number; data: string; lineBreak: boolean } | null = null;
 
 document.addEventListener("beforeinput", (e) => {
+  if (siteDisabled) return;
   const ie = e as InputEvent;
   if (!e.isTrusted || ie.isComposing) return;
   const target = e.target as HTMLElement;
@@ -782,6 +944,7 @@ document.addEventListener("beforeinput", (e) => {
 }, true);
 
 document.addEventListener("input", (e) => {
+  if (siteDisabled) return;
   const ie = e as InputEvent;
   if (!e.isTrusted || ie.isComposing) return;
   const target = e.target as HTMLElement;
@@ -810,5 +973,6 @@ document.addEventListener("input", (e) => {
 }, true);
 
 document.addEventListener("focusin", (e) => {
+  if (siteDisabled) return;
   onFocusIn(e.target as HTMLElement);
 }, true);

@@ -8,20 +8,42 @@
   cursor: pointer;
 }
 
-/* Transient indicator pill for plain textareas (no inline markup possible). */
+/* Transient indicator pill for plain textareas (no inline markup possible).
+   Shows the corrected sentence with each changed word as `was → now`, plus
+   Undo / dismiss. Auto-hides after ~8s; Undo reverts every hunk in the pill. */
 .ft-pill {
   position: fixed;
   z-index: 2147483647;
   display: flex;
-  align-items: center;
+  flex-direction: column;
   gap: 6px;
-  max-width: 360px;
-  padding: 6px 8px;
-  font: 12px/1.4 system-ui, sans-serif;
+  max-width: 380px;
+  padding: 8px 10px;
+  font: 12px/1.5 system-ui, sans-serif;
   color: #fff;
-  background: rgba(20, 26, 40, 0.94);
+  background: rgba(20, 26, 40, 0.95);
   border-radius: 6px;
   box-shadow: 0 2px 10px rgba(0, 0, 0, 0.25);
+}
+
+.ft-pill-body {
+  overflow-wrap: break-word;
+}
+
+.ft-pill-change { white-space: nowrap; }
+.ft-pill-was {
+  color: #fca5a5;
+  text-decoration: line-through;
+}
+.ft-pill-now {
+  color: #a5d6ff;
+  font-weight: 600;
+}
+
+.ft-pill-row {
+  display: flex;
+  justify-content: flex-end;
+  gap: 6px;
 }
 
 .ft-pill-btn {
@@ -34,6 +56,13 @@
   cursor: pointer;
 }
 .ft-pill-btn:hover { background: #2563eb; }
+.ft-pill-x {
+  background: transparent;
+  color: #cbd5e1;
+  font-size: 13px;
+  padding: 1px 5px;
+}
+.ft-pill-x:hover { background: rgba(255, 255, 255, 0.15); }
 
 /* Hover tooltip over an applied correction in contenteditable editors. */
 .ft-tooltip {

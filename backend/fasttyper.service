@@ -10,6 +10,11 @@ Environment="AMD_VULKAN_ASYNC_COMPUTE=1"
 # that's a Debian naming convention). A wrong path loads zero ICDs and silently
 # falls back to CPU.
 Environment="VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/radeon_icd.json"
+# llama-server's shared libs (libllama-server-impl.so, libllama-*.so.0) are
+# installed to /usr/local/lib by `cmake --install`. /usr/local/lib isn't on
+# Arch's default ldconfig search path, so point the loader at it directly —
+# this keeps the daemon working even if the linker cache isn't rebuilt.
+Environment="LD_LIBRARY_PATH=/usr/local/lib"
 # -ngl 99: Offload all layers
 # -cb: Continuous batching
 # --split-mode none: Optimal for UMA iGPUs

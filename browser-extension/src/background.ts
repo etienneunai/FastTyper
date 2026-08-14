@@ -18,9 +18,10 @@ const LOG_CAP = 50;
 interface Settings {
   paused: boolean;
   capitalize: boolean;
+  blacklist: string[];
 }
 
-const DEFAULT_SETTINGS: Settings = { paused: false, capitalize: true };
+const DEFAULT_SETTINGS: Settings = { paused: false, capitalize: true, blacklist: [] };
 
 async function getSettings(): Promise<Settings> {
   const got = await browser.storage.local.get(SETTINGS_KEY);
@@ -29,7 +30,7 @@ async function getSettings(): Promise<Settings> {
 
 async function saveSettings(s: Settings): Promise<void> {
   await browser.storage.local.set({ [SETTINGS_KEY]: s });
-  await broadcast({ type: "settings", paused: s.paused, capitalize: s.capitalize });
+  await broadcast({ type: "settings", paused: s.paused, capitalize: s.capitalize, blacklist: s.blacklist });
 }
 
 async function broadcast(msg: PushMsg): Promise<void> {
@@ -130,9 +131,16 @@ browser.runtime.onMessage.addListener(
           )
         );
 
+      case "setBlacklist":
+        return getSettings().then((s) =>
+          saveSettings({ ...s, blacklist: msg.blacklist }).then(
+            (): Response => ({ type: "correctResult", corrected: null })
+          )
+        );
+
       case "getState":
         return Promise.all([getSettings(), daemonUp()]).then(
-          ([s, up]): Response => ({ type: "state", paused: s.paused, capitalize: s.capitalize, daemonUp: up })
+          ([s, up]): Response => ({ type: "state", paused: s.paused, capitalize: s.capitalize, blacklist: s.blacklist, daemonUp: up })
         );
 
       case "getLog":

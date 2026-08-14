@@ -1,7 +1,7 @@
 {
   "id": "fasttyper",
   "name": "FastTyper",
-  "version": "1.1.0",
+  "version": "1.1.4",
   "minAppVersion": "1.0.0",
   "description": "Real-time grammar correction powered by local Vulkan LLM.",
   "author": "Antigravity",

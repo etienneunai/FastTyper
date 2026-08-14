@@ -23,8 +23,10 @@ __export(main_exports, {
   default: () => FastTyperPlugin,
   grammarCorrectionsField: () => grammarCorrectionsField,
   grammarTooltip: () => grammarTooltip,
+  processingField: () => processingField,
   revertCorrection: () => revertCorrection,
-  setCorrections: () => setCorrections
+  setCorrections: () => setCorrections,
+  setProcessing: () => setProcessing
 });
 module.exports = __toCommonJS(main_exports);
 var import_obsidian = require("obsidian");
@@ -66,6 +68,24 @@ var PROMPT_PRESETS = [
 ];
 var LLM_LOG_PATH = "/home/etienne/Projects/FastTyper/llm-log.txt";
 var ABBREVIATIONS = /* @__PURE__ */ new Set(["e.g.", "i.e.", "etc.", "Mr.", "Mrs.", "Ms.", "Dr.", "St.", "vs.", "no."]);
+var DEBUG_LOG_PATH = "/home/etienne/Projects/FastTyper/trigger-debug.log";
+function debugLog(msg) {
+  try {
+    if (fsModule === null) {
+      try {
+        fsModule = require("fs");
+      } catch (e) {
+        fsModule = false;
+      }
+    }
+    if (!fsModule)
+      return;
+    fsModule.appendFileSync(DEBUG_LOG_PATH, `${(/* @__PURE__ */ new Date()).toISOString()} ${msg}
+`, "utf8");
+  } catch (e) {
+    console.error("FastTyper: failed to write debug log", e);
+  }
+}
 var fsModule = null;
 function logExchange(sent, received) {
   try {
@@ -99,6 +119,7 @@ var capitalizeInitials = true;
 var promptId = "A";
 var customSystem = PROMPT_PRESETS[0].system;
 var customUser = PROMPT_PRESETS[0].user;
+var thinkingMode = "auto";
 function activePrompt() {
   var _a;
   if (promptId === CUSTOM_PROMPT_ID)
@@ -164,6 +185,31 @@ var grammarCorrectionsField = import_state.StateField.define({
     return decorations;
   },
   provide: (f) => import_view.EditorView.decorations.from(f)
+});
+var setProcessing = import_state.StateEffect.define();
+var processingField = import_state.StateField.define({
+  create() {
+    return null;
+  },
+  update(state, tr) {
+    if (state) {
+      state = {
+        from: tr.changes.mapPos(state.from, 1),
+        to: tr.changes.mapPos(state.to, -1),
+        thinking: state.thinking
+      };
+      if (state.from >= state.to)
+        state = null;
+    }
+    for (const e of tr.effects) {
+      if (e.is(setProcessing))
+        state = e.value;
+    }
+    return state;
+  },
+  provide: (f) => import_view.EditorView.decorations.from(f, (s) => s ? import_view.Decoration.set([import_view.Decoration.mark({
+    class: s.thinking ? "ft-processing ft-processing-thinking" : "ft-processing"
+  }).range(s.from, s.to)]) : import_view.Decoration.none)
 });
 var CONTEXT_CHARS = 10;
 function contextSnippet(doc, from, to, original, replacement) {
@@ -354,7 +400,8 @@ var grammarCheckerPlugin = import_view.ViewPlugin.fromClass(class {
       this.verifyPos = update.changes.mapPos(this.verifyPos, 1);
     if (!update.docChanged)
       return;
-    const isAutoApply = update.transactions.some((tr) => tr.effects.some((e) => e.is(setCorrections) || e.is(revertCorrection) || e.is(clearCorrections)));
+    debugLog(`UPDATE docChanged chgCount=${update.changes.length} isAutoApply=${update.transactions.some((tr) => tr.effects.some((e) => e.is(setCorrections) || e.is(revertCorrection) || e.is(clearCorrections)))} paused=${this.paused} pendingVerify=${this.verifyTimeout !== null} isPending=${this.isPending} queued=${!!this.queued}`);
+    const isAutoApply = update.transactions.some((tr) => tr.effects.some((e) => e.is(setCorrections) || e.is(revertCorrection) || e.is(clearCorrections) || e.is(setProcessing)));
     if (isAutoApply)
       return;
     if (this.paused)
@@ -362,8 +409,11 @@ var grammarCheckerPlugin = import_view.ViewPlugin.fromClass(class {
     const trig = this.findTrigger(update);
     if (!trig)
       return;
-    if (this.verifyTimeout)
+    if (this.verifyTimeout) {
       clearTimeout(this.verifyTimeout);
+      this.verifyTimeout = null;
+      this.confirmTrigger();
+    }
     this.verifyPos = trig.pos;
     this.verifyChar = trig.ch;
     this.verifyTimeout = setTimeout(() => this.confirmTrigger(), TRIGGER_VERIFY_MS);
@@ -373,9 +423,10 @@ var grammarCheckerPlugin = import_view.ViewPlugin.fromClass(class {
     for (let t = update.transactions.length - 1; t >= 0; t--) {
       let found = null;
       update.transactions[t].changes.iterChanges((fromA, toA, fromB, toB, inserted) => {
-        if (fromA !== toA)
-          return;
         const s = inserted.toString();
+        debugLog(`  t${t} change ${fromA}->${toA} | ${fromB}->${toB} | ins=${JSON.stringify(s)}`);
+        if (fromA !== toA && !s.includes("\n"))
+          return;
         for (let k = s.length - 1; k >= 0; k--) {
           const c = s[k];
           if (c === "." || c === "?" || c === "!" || c === "\n") {
@@ -398,8 +449,10 @@ var grammarCheckerPlugin = import_view.ViewPlugin.fromClass(class {
     this.verifyPos = null;
     this.verifyChar = "";
     const doc = this.view.state.doc;
-    if (pos >= doc.length || doc.sliceString(pos, pos + 1) !== ch)
+    if (pos >= doc.length || doc.sliceString(pos, pos + 1) !== ch) {
+      debugLog(`  confirm REJECT ch=${ch} pos=${pos} len=${doc.length} present=${pos < doc.length ? doc.sliceString(pos, pos + 1) : "EOF"}`);
       return;
+    }
     if (ch === ".") {
       const next = pos + 1 < doc.length ? doc.sliceString(pos + 1, pos + 2) : "";
       if (next !== "" && !/\s/.test(next) && !`"')]}`.includes(next))
@@ -409,14 +462,23 @@ var grammarCheckerPlugin = import_view.ViewPlugin.fromClass(class {
         return;
     }
     const span = ch === "\n" ? this.lineSpan(pos) : this.sentenceSpan(pos);
-    if (!span)
+    if (!span) {
+      debugLog(`  confirm REJECT ch=${ch} pos=${pos} span=null (lineSpan failed)`);
       return;
-    if (span.to - span.from > MAX_UNIT_CHARS)
+    }
+    if (span.to - span.from > MAX_UNIT_CHARS) {
+      debugLog(`  confirm REJECT ch=${ch} pos=${pos} too-long ${span.to - span.from}`);
       return;
-    if (doc.sliceString(span.from, span.to).trim().length < MIN_UNIT_CHARS)
+    }
+    if (doc.sliceString(span.from, span.to).trim().length < MIN_UNIT_CHARS) {
+      debugLog(`  confirm REJECT ch=${ch} pos=${pos} too-short "${doc.sliceString(span.from, span.to).trim()}"`);
       return;
-    if (this.containsCode(span.from, span.to))
+    }
+    if (this.containsCode(span.from, span.to)) {
+      debugLog(`  confirm REJECT ch=${ch} pos=${pos} contains-code`);
       return;
+    }
+    debugLog(`  confirm FIRE ch=${ch} pos=${pos} span=[${span.from},${span.to}) unit="${doc.sliceString(span.from, span.to).trim()}"`);
     this.queued = span;
     this.maybeFire();
   }
@@ -522,6 +584,8 @@ var grammarCheckerPlugin = import_view.ViewPlugin.fromClass(class {
   async fire(span) {
     this.isPending = true;
     this.pending = { from: span.from, to: span.to, text: "", lead: 0 };
+    let thinking = thinkingMode === "always";
+    this.markProcessing(thinking);
     try {
       for (let retries = 0; retries <= MAX_RETRIES; retries++) {
         const raw = this.view.state.doc.sliceString(this.pending.from, this.pending.to);
@@ -537,7 +601,7 @@ var grammarCheckerPlugin = import_view.ViewPlugin.fromClass(class {
         this.abortController = controller;
         let corrected = null;
         try {
-          corrected = await this.request(text, controller.signal);
+          corrected = await this.request(text, controller.signal, thinking);
         } catch (e) {
           if ((e == null ? void 0 : e.name) !== "AbortError") {
             console.error("FastTyper: grammar request failed", e);
@@ -550,8 +614,14 @@ var grammarCheckerPlugin = import_view.ViewPlugin.fromClass(class {
         if (!corrected)
           return;
         corrected = this.capitalizeInitial(corrected);
-        if (corrected === text)
+        if (corrected === text) {
+          if (thinkingMode === "auto" && !thinking) {
+            thinking = true;
+            this.markProcessing(true);
+            continue;
+          }
           return;
+        }
         const nowText = this.view.state.doc.sliceString(this.pending.from, this.pending.to).trim();
         if (nowText !== text) {
           if (retries < MAX_RETRIES)
@@ -564,11 +634,28 @@ var grammarCheckerPlugin = import_view.ViewPlugin.fromClass(class {
         return;
       }
     } finally {
+      if (!this.destroyed)
+        this.view.dispatch({ effects: setProcessing.of(null) });
       this.isPending = false;
       this.abortController = null;
       this.pending = null;
       this.maybeFire();
     }
+  }
+  /**
+   * Mark the in-flight unit with the amber processing underline. Deferred via
+   * queueMicrotask: `fire()` can be reached synchronously from `update()` (the
+   * newline path confirmTrigger → maybeFire), and dispatching to the view while
+   * an update is in progress throws.
+   */
+  markProcessing(thinking) {
+    if (!this.pending)
+      return;
+    queueMicrotask(() => {
+      if (this.destroyed || !this.pending)
+        return;
+      this.view.dispatch({ effects: setProcessing.of({ from: this.pending.from, to: this.pending.to, thinking }) });
+    });
   }
   /** Capitalize the sentence-initial letter (lowercase a-z first char only), if enabled. */
   capitalizeInitial(corrected) {
@@ -579,23 +666,32 @@ var grammarCheckerPlugin = import_view.ViewPlugin.fromClass(class {
       return c0.toUpperCase() + corrected.slice(1);
     return corrected;
   }
-  /** POST the unit to the daemon and return the corrected text (or null). */
-  async request(text, signal) {
-    var _a, _b, _c;
-    const { system, user } = activePrompt();
+  /**
+   * POST the unit to the daemon and return the corrected text (or null).
+   * When `thinking` is true the request uses the E (proof) preset with Qwen3
+   * thinking enabled and a reasoning_budget_tokens cap — the config the eval
+   * matrix proved fixes the hard dyslexic cases (9/10) that flat inference
+   * leaves unchanged (6/10), at ~6–12 s instead of ~0.4 s.
+   */
+  async request(text, signal, thinking) {
+    var _a, _b, _c, _d;
+    const prompt = thinking ? (_a = PROMPT_PRESETS.find((p) => p.id === "E")) != null ? _a : PROMPT_PRESETS[0] : activePrompt();
     const payload = {
       model: MODEL,
       messages: [
-        { role: "system", content: system },
-        { role: "user", content: user.split("{text}").join(text) }
+        { role: "system", content: prompt.system },
+        { role: "user", content: prompt.user.split("{text}").join(text) }
       ],
       temperature: 0,
-      max_tokens: Math.min(2048, Math.ceil(text.length / 3) + 256),
-      // Force-disable Qwen3 thinking mode (template enable_thinking=false).
-      // Without this the model decides per-prompt and the proofreader/
-      // cleaner presets burn max_tokens on reasoning_content, returning
-      // empty output. Belt-and-suspenders with --reasoning off on the daemon.
-      chat_template_kwargs: { enable_thinking: false }
+      // Thinking needs headroom for the reasoning block; flat stays capped
+      // by text length. Never let a runaway thinking pass burn the whole
+      // budget and return empty (see reasoning_budget_tokens below).
+      max_tokens: thinking ? 2048 : Math.min(2048, Math.ceil(text.length / 3) + 256),
+      chat_template_kwargs: { enable_thinking: thinking },
+      // Per-request reasoning cap: force-emits the end-of-thinking tag when
+      // exhausted, so the model can't burn max_tokens on reasoning_content
+      // and return an empty no-op (the eval's 91.6 s → 6–12 s fix).
+      ...thinking ? { reasoning_budget_tokens: 256 } : {}
     };
     const body = JSON.stringify(payload);
     const response = await fetch(LLM_URL, {
@@ -616,7 +712,7 @@ var grammarCheckerPlugin = import_view.ViewPlugin.fromClass(class {
     } catch (e) {
       return null;
     }
-    const content = (_c = (_b = (_a = data == null ? void 0 : data.choices) == null ? void 0 : _a[0]) == null ? void 0 : _b.message) == null ? void 0 : _c.content;
+    const content = (_d = (_c = (_b = data == null ? void 0 : data.choices) == null ? void 0 : _b[0]) == null ? void 0 : _c.message) == null ? void 0 : _d.content;
     if (typeof content !== "string")
       return null;
     const corrected = parseResponse(content);
@@ -660,6 +756,7 @@ var FastTyperSettingTab = class extends import_obsidian.PluginSettingTab {
     new import_obsidian.Setting(containerEl).setName("Pause corrections").setDesc("Stop triggering new corrections. Applied corrections stay until accepted or reverted.").addToggle((toggle) => toggle.setValue(correctionsPaused).onChange((value) => this.plugin.setPaused(value)));
     new import_obsidian.Setting(containerEl).setName("Capitalize sentence-initial letters").setDesc("Capitalize the first letter of each corrected sentence. Done deterministically in the plugin (the model is spelling-only and won't do it).").addToggle((toggle) => toggle.setValue(capitalizeInitials).onChange((value) => this.plugin.setCapitalizeInitials(value)));
     new import_obsidian.Setting(containerEl).setName("Correction prompt").setDesc("Which prompt to send the model. A \u2014 prod: the default, spelling-only, never corrupts correct text. B \u2014 gram: adds missing spaces and a/an, keeps A's safety and speed. E \u2014 proof: most capable (a/an, apostrophes, run-together) but slow \u2014 emits a ~340-token reasoning block per request (6\u201325 s). C \u2014 clean: fixes a/an and run-together but unreliable (empty outputs, mid-sentence truncation) \u2014 a correction risk. Custom: edit both messages.").addDropdown((drop) => drop.addOption("A", "A \u2014 prod").addOption("B", "B \u2014 gram").addOption("E", "E \u2014 proof").addOption("C", "C \u2014 clean").addOption(CUSTOM_PROMPT_ID, "Custom").setValue(promptId).onChange((value) => this.plugin.setPromptId(value)));
+    new import_obsidian.Setting(containerEl).setName("Thinking mode").setDesc("Auto \u2014 flat attempt first (~0.4 s); escalates once to E + thinking (~6\u201312 s) only if flat changes nothing. Always \u2014 E + thinking on every trigger. Fast \u2014 flat-only, current behavior. While correcting, the unit is underlined amber; it pulses while thinking.").addDropdown((drop) => drop.addOption("fast", "Fast").addOption("auto", "Auto").addOption("always", "Always").setValue(thinkingMode).onChange((value) => this.plugin.setThinkingMode(value)));
     if (promptId === CUSTOM_PROMPT_ID) {
       new import_obsidian.Setting(containerEl).setName("Custom system prompt").setDesc("The system message sent with every request.").addTextArea((text) => text.setPlaceholder(PROMPT_PRESETS[0].system).setValue(customSystem).onChange((value) => this.plugin.setCustomSystem(value)));
       new import_obsidian.Setting(containerEl).setName("Custom user prompt").setDesc("The user-message template. {text} is replaced with the sentence/line to correct.").addTextArea((text) => text.setPlaceholder(PROMPT_PRESETS[0].user).setValue(customUser).onChange((value) => this.plugin.setCustomUser(value)));
@@ -673,7 +770,9 @@ var FastTyperPlugin = class extends import_obsidian.Plugin {
     this.settingsTab = null;
   }
   async onload() {
+    var _a, _b;
     console.log("Loading FastTyper plugin");
+    debugLog(`ONLOAD plugin v${(_b = (_a = this.manifest) == null ? void 0 : _a.version) != null ? _b : "?"} loaded`);
     const data = await this.loadData();
     if (data == null ? void 0 : data.paused)
       correctionsPaused = true;
@@ -685,6 +784,8 @@ var FastTyperPlugin = class extends import_obsidian.Plugin {
       customSystem = data.customSystem;
     if (typeof (data == null ? void 0 : data.customUser) === "string")
       customUser = data.customUser;
+    if ((data == null ? void 0 : data.thinkingMode) === "fast" || (data == null ? void 0 : data.thinkingMode) === "auto" || (data == null ? void 0 : data.thinkingMode) === "always")
+      thinkingMode = data.thinkingMode;
     this.addCommand({
       id: "accept-all-corrections",
       name: "Accept all corrections",
@@ -695,10 +796,19 @@ var FastTyperPlugin = class extends import_obsidian.Plugin {
       name: "Pause/resume corrections",
       callback: () => this.setPaused(!correctionsPaused)
     });
+    this.addCommand({
+      id: "cycle-thinking-mode",
+      name: "Cycle thinking mode (fast/auto/always)",
+      callback: () => {
+        const next = thinkingMode === "fast" ? "auto" : thinkingMode === "auto" ? "always" : "fast";
+        this.setThinkingMode(next);
+      }
+    });
     this.settingsTab = new FastTyperSettingTab(this.app, this);
     this.addSettingTab(this.settingsTab);
     this.registerEditorExtension([
       grammarCorrectionsField,
+      processingField,
       grammarTooltip,
       grammarCheckerPlugin
     ]);
@@ -737,6 +847,14 @@ var FastTyperPlugin = class extends import_obsidian.Plugin {
     await this.saveSettings();
     (_a = this.settingsTab) == null ? void 0 : _a.display();
   }
+  /** Select the thinking mode (`fast`/`auto`/`always`) and persist. */
+  async setThinkingMode(mode) {
+    var _a;
+    thinkingMode = mode;
+    await this.saveSettings();
+    (_a = this.settingsTab) == null ? void 0 : _a.display();
+    new import_obsidian.Notice(`FastTyper: thinking mode = ${mode}`);
+  }
   /** Set the custom system message (used with the Custom prompt) and persist. */
   async setCustomSystem(value) {
     customSystem = value;
@@ -749,7 +867,7 @@ var FastTyperPlugin = class extends import_obsidian.Plugin {
   }
   /** Persist the current settings to plugin data. */
   async saveSettings() {
-    await this.saveData({ paused: correctionsPaused, capitalizeInitials, promptId, customSystem, customUser });
+    await this.saveData({ paused: correctionsPaused, capitalizeInitials, promptId, customSystem, customUser, thinkingMode });
   }
   /** Push the current pause state to every open editor's corrector instance. */
   applyPauseState() {

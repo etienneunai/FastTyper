@@ -72,6 +72,21 @@ const ABBREVIATIONS = new Set(["e.g.", "i.e.", "etc.", "Mr.", "Mrs.", "Ms.", "Dr
 
 declare const require: (id: string) => any;
 
+/** Temporary trigger-path diagnostics (newline not firing). Appended per call. */
+const DEBUG_LOG_PATH = "/home/etienne/Projects/FastTyper/trigger-debug.log";
+
+function debugLog(msg: string): void {
+    try {
+        if (fsModule === null) {
+            try { fsModule = require("fs"); } catch { fsModule = false; }
+        }
+        if (!fsModule) return;
+        fsModule.appendFileSync(DEBUG_LOG_PATH, `${new Date().toISOString()} ${msg}\n`, "utf8");
+    } catch (e) {
+        console.error("FastTyper: failed to write debug log", e);
+    }
+}
+
 let fsModule: any = null;
 /** Append one `sent:\n…\nreceived:\n…` exchange to LLM_LOG_PATH. */
 function logExchange(sent: string, received: string): void {
@@ -103,6 +118,13 @@ let promptId = "A";
 let customSystem = PROMPT_PRESETS[0].system;
 /** Custom user-message template with `{text}` (used when `promptId === CUSTOM_PROMPT_ID`). */
 let customUser = PROMPT_PRESETS[0].user;
+/**
+ * Thinking mode: "fast" = flat inference only (current behavior); "auto" = flat
+ * first, escalate once to E + thinking only if flat changes nothing; "always" =
+ * E + thinking on every request. (Thinking = E preset + enable_thinking + a
+ * reasoning_budget_tokens cap — see `request()`.)
+ */
+let thinkingMode: "fast" | "auto" | "always" = "auto";
 
 /** The active system message + user template pair, from the selected preset or the custom fields. */
 function activePrompt(): { system: string; user: string } {
@@ -169,6 +191,41 @@ export const grammarCorrectionsField = StateField.define<DecorationSet>({
         return decorations;
     },
     provide: (f) => EditorView.decorations.from(f)
+});
+
+/** In-flight marker: the unit currently being corrected, with its thinking state. */
+export const setProcessing = StateEffect.define<{ from: number; to: number; thinking: boolean } | null>();
+
+/**
+ * Amber underline over the unit while its correction request is in flight.
+ * Pulses while the thinking pass is active (`.ft-processing-thinking`).
+ * The stored span is mapped through every change so the underline tracks the
+ * text while the user keeps typing; it collapses to null if the unit is deleted.
+ */
+export const processingField = StateField.define<{ from: number; to: number; thinking: boolean } | null>({
+    create() {
+        return null;
+    },
+    update(state, tr: Transaction) {
+        if (state) {
+            state = {
+                from: tr.changes.mapPos(state.from, 1),
+                to: tr.changes.mapPos(state.to, -1),
+                thinking: state.thinking
+            };
+            if (state.from >= state.to) state = null; // unit deleted/collapsed mid-flight
+        }
+        for (const e of tr.effects) {
+            if (e.is(setProcessing)) state = e.value;
+        }
+        return state;
+    },
+    provide: (f) => EditorView.decorations.from(f, (s) =>
+        s
+            ? Decoration.set([Decoration.mark({
+                class: s.thinking ? "ft-processing ft-processing-thinking" : "ft-processing"
+            }).range(s.from, s.to)])
+            : Decoration.none)
 });
 
 const CONTEXT_CHARS = 10;
@@ -376,8 +433,15 @@ const grammarCheckerPlugin = ViewPlugin.fromClass(class {
 
         if (!update.docChanged) return;
 
+        // Log every doc change BEFORE any early-return so a silent pause/auto-apply
+        // short-circuit is visible in the trace (the newline trigger was "not firing").
+        debugLog(`UPDATE docChanged chgCount=${update.changes.length} isAutoApply=${update.transactions.some(tr => tr.effects.some(e => e.is(setCorrections) || e.is(revertCorrection) || e.is(clearCorrections)))} paused=${this.paused} pendingVerify=${this.verifyTimeout !== null} isPending=${this.isPending} queued=${!!this.queued}`);
+
         // Ignore our own corrections/reverts so we don't re-trigger on them.
-        const isAutoApply = update.transactions.some(tr => tr.effects.some(e => e.is(setCorrections) || e.is(revertCorrection) || e.is(clearCorrections)));
+        // (setProcessing is effect-only so `!update.docChanged` already short-circuits
+        // above — this is belt-and-suspenders in case a changes+setProcessing
+        // transaction ever fires.)
+        const isAutoApply = update.transactions.some(tr => tr.effects.some(e => e.is(setCorrections) || e.is(revertCorrection) || e.is(clearCorrections) || e.is(setProcessing)));
         if (isAutoApply) return;
         if (this.paused) return;
 
@@ -403,8 +467,14 @@ const grammarCheckerPlugin = ViewPlugin.fromClass(class {
         for (let t = update.transactions.length - 1; t >= 0; t--) {
             let found: { pos: number; ch: string } | null = null;
             update.transactions[t].changes.iterChanges((fromA, toA, fromB, toB, inserted) => {
-                if (fromA !== toA) return; // only count pure insertions
                 const s = inserted.toString();
+                debugLog(`  t${t} change ${fromA}->${toA} | ${fromB}->${toB} | ins=${JSON.stringify(s)}`);
+                // Only count pure insertions for punctuation triggers, but always
+                // count an inserted line break — Obsidian's list continuation
+                // (Enter at a bullet) lands as a replacement transaction like
+                // "y\n- " (fromA !== toA), which would otherwise never fire the
+                // newline trigger.
+                if (fromA !== toA && !s.includes('\n')) return;
                 for (let k = s.length - 1; k >= 0; k--) {
                     const c = s[k];
                     if (c === '.' || c === '?' || c === '!' || c === '\n') {
@@ -427,7 +497,10 @@ const grammarCheckerPlugin = ViewPlugin.fromClass(class {
         this.verifyChar = "";
 
         const doc = this.view.state.doc;
-        if (pos >= doc.length || doc.sliceString(pos, pos + 1) !== ch) return;
+        if (pos >= doc.length || doc.sliceString(pos, pos + 1) !== ch) {
+            debugLog(`  confirm REJECT ch=${ch} pos=${pos} len=${doc.length} present=${pos < doc.length ? doc.sliceString(pos, pos + 1) : "EOF"}`);
+            return;
+        }
 
         // "." only counts as a sentence end if followed by whitespace/EOL/a closer
         // (rejects "3.14", "v1.2.3") and not an abbreviation ("e.g.", "Mr.").
@@ -439,11 +512,24 @@ const grammarCheckerPlugin = ViewPlugin.fromClass(class {
         }
 
         const span = ch === '\n' ? this.lineSpan(pos) : this.sentenceSpan(pos);
-        if (!span) return;
-        if (span.to - span.from > MAX_UNIT_CHARS) return;
-        if (doc.sliceString(span.from, span.to).trim().length < MIN_UNIT_CHARS) return;
-        if (this.containsCode(span.from, span.to)) return;
+        if (!span) {
+            debugLog(`  confirm REJECT ch=${ch} pos=${pos} span=null (lineSpan failed)`);
+            return;
+        }
+        if (span.to - span.from > MAX_UNIT_CHARS) {
+            debugLog(`  confirm REJECT ch=${ch} pos=${pos} too-long ${span.to - span.from}`);
+            return;
+        }
+        if (doc.sliceString(span.from, span.to).trim().length < MIN_UNIT_CHARS) {
+            debugLog(`  confirm REJECT ch=${ch} pos=${pos} too-short "${doc.sliceString(span.from, span.to).trim()}"`);
+            return;
+        }
+        if (this.containsCode(span.from, span.to)) {
+            debugLog(`  confirm REJECT ch=${ch} pos=${pos} contains-code`);
+            return;
+        }
 
+        debugLog(`  confirm FIRE ch=${ch} pos=${pos} span=[${span.from},${span.to}) unit="${doc.sliceString(span.from, span.to).trim()}"`);
         this.queued = span;
         this.maybeFire();
     }
@@ -555,6 +641,9 @@ const grammarCheckerPlugin = ViewPlugin.fromClass(class {
     private async fire(span: { from: number; to: number }) {
         this.isPending = true;
         this.pending = { from: span.from, to: span.to, text: "", lead: 0 };
+        // "auto" starts flat and escalates once (below) if flat changes nothing.
+        let thinking = thinkingMode === "always";
+        this.markProcessing(thinking);
         try {
             for (let retries = 0; retries <= MAX_RETRIES; retries++) {
                 const raw = this.view.state.doc.sliceString(this.pending.from, this.pending.to);
@@ -570,7 +659,7 @@ const grammarCheckerPlugin = ViewPlugin.fromClass(class {
 
                 let corrected: string | null = null;
                 try {
-                    corrected = await this.request(text, controller.signal);
+                    corrected = await this.request(text, controller.signal, thinking);
                 } catch (e: any) {
                     if (e?.name !== 'AbortError') {
                         console.error("FastTyper: grammar request failed", e);
@@ -582,7 +671,17 @@ const grammarCheckerPlugin = ViewPlugin.fromClass(class {
 
                 if (!corrected) return; // nothing usable from the model
                 corrected = this.capitalizeInitial(corrected);
-                if (corrected === text) return; // no change after capitalization either
+                if (corrected === text) {
+                    // Flat changed nothing — "auto" escalates once to E + thinking.
+                    // A thinking no-op is final: thinking is non-deterministic at
+                    // temperature 0 (~2/3 on the hardest case), so never loop it.
+                    if (thinkingMode === "auto" && !thinking) {
+                        thinking = true;
+                        this.markProcessing(true);
+                        continue; // consumes one retry slot (MAX_RETRIES=3)
+                    }
+                    return;
+                }
 
                 const nowText = this.view.state.doc.sliceString(this.pending.from, this.pending.to).trim();
                 if (nowText !== text) {
@@ -596,11 +695,26 @@ const grammarCheckerPlugin = ViewPlugin.fromClass(class {
                 return;
             }
         } finally {
+            if (!this.destroyed) this.view.dispatch({ effects: setProcessing.of(null) });
             this.isPending = false;
             this.abortController = null;
             this.pending = null;
             this.maybeFire();
         }
+    }
+
+    /**
+     * Mark the in-flight unit with the amber processing underline. Deferred via
+     * queueMicrotask: `fire()` can be reached synchronously from `update()` (the
+     * newline path confirmTrigger → maybeFire), and dispatching to the view while
+     * an update is in progress throws.
+     */
+    private markProcessing(thinking: boolean) {
+        if (!this.pending) return;
+        queueMicrotask(() => {
+            if (this.destroyed || !this.pending) return;
+            this.view.dispatch({ effects: setProcessing.of({ from: this.pending.from, to: this.pending.to, thinking }) });
+        });
     }
 
     /** Capitalize the sentence-initial letter (lowercase a-z first char only), if enabled. */
@@ -611,22 +725,31 @@ const grammarCheckerPlugin = ViewPlugin.fromClass(class {
         return corrected;
     }
 
-    /** POST the unit to the daemon and return the corrected text (or null). */
-    private async request(text: string, signal: AbortSignal): Promise<string | null> {
-        const { system, user } = activePrompt();
+    /**
+     * POST the unit to the daemon and return the corrected text (or null).
+     * When `thinking` is true the request uses the E (proof) preset with Qwen3
+     * thinking enabled and a reasoning_budget_tokens cap — the config the eval
+     * matrix proved fixes the hard dyslexic cases (9/10) that flat inference
+     * leaves unchanged (6/10), at ~6–12 s instead of ~0.4 s.
+     */
+    private async request(text: string, signal: AbortSignal, thinking: boolean): Promise<string | null> {
+        const prompt = thinking ? PROMPT_PRESETS.find(p => p.id === "E") ?? PROMPT_PRESETS[0] : activePrompt();
         const payload = {
             model: MODEL,
             messages: [
-                { role: "system", content: system },
-                { role: "user", content: user.split("{text}").join(text) }
+                { role: "system", content: prompt.system },
+                { role: "user", content: prompt.user.split("{text}").join(text) }
             ],
             temperature: 0,
-            max_tokens: Math.min(2048, Math.ceil(text.length / 3) + 256),
-            // Force-disable Qwen3 thinking mode (template enable_thinking=false).
-            // Without this the model decides per-prompt and the proofreader/
-            // cleaner presets burn max_tokens on reasoning_content, returning
-            // empty output. Belt-and-suspenders with --reasoning off on the daemon.
-            chat_template_kwargs: { enable_thinking: false }
+            // Thinking needs headroom for the reasoning block; flat stays capped
+            // by text length. Never let a runaway thinking pass burn the whole
+            // budget and return empty (see reasoning_budget_tokens below).
+            max_tokens: thinking ? 2048 : Math.min(2048, Math.ceil(text.length / 3) + 256),
+            chat_template_kwargs: { enable_thinking: thinking },
+            // Per-request reasoning cap: force-emits the end-of-thinking tag when
+            // exhausted, so the model can't burn max_tokens on reasoning_content
+            // and return an empty no-op (the eval's 91.6 s → 6–12 s fix).
+            ...(thinking ? { reasoning_budget_tokens: 256 } : {})
         };
         const body = JSON.stringify(payload);
 
@@ -724,6 +847,16 @@ class FastTyperSettingTab extends PluginSettingTab {
                 .setValue(promptId)
                 .onChange(value => this.plugin.setPromptId(value)));
 
+        new Setting(containerEl)
+            .setName("Thinking mode")
+            .setDesc("Auto — flat attempt first (~0.4 s); escalates once to E + thinking (~6–12 s) only if flat changes nothing. Always — E + thinking on every trigger. Fast — flat-only, current behavior. While correcting, the unit is underlined amber; it pulses while thinking.")
+            .addDropdown(drop => drop
+                .addOption("fast", "Fast")
+                .addOption("auto", "Auto")
+                .addOption("always", "Always")
+                .setValue(thinkingMode)
+                .onChange(value => this.plugin.setThinkingMode(value as "fast" | "auto" | "always")));
+
         if (promptId === CUSTOM_PROMPT_ID) {
             new Setting(containerEl)
                 .setName("Custom system prompt")
@@ -756,12 +889,14 @@ export default class FastTyperPlugin extends Plugin {
 
     async onload() {
         console.log('Loading FastTyper plugin');
+        debugLog(`ONLOAD plugin v${(this.manifest as any)?.version ?? "?"} loaded`);
         const data = await this.loadData();
         if (data?.paused) correctionsPaused = true;
         if (typeof data?.capitalizeInitials === "boolean") capitalizeInitials = data.capitalizeInitials;
         if (typeof data?.promptId === "string") promptId = data.promptId;
         if (typeof data?.customSystem === "string") customSystem = data.customSystem;
         if (typeof data?.customUser === "string") customUser = data.customUser;
+        if (data?.thinkingMode === "fast" || data?.thinkingMode === "auto" || data?.thinkingMode === "always") thinkingMode = data.thinkingMode;
 
         this.addCommand({
             id: "accept-all-corrections",
@@ -773,12 +908,21 @@ export default class FastTyperPlugin extends Plugin {
             name: "Pause/resume corrections",
             callback: () => this.setPaused(!correctionsPaused)
         });
+        this.addCommand({
+            id: "cycle-thinking-mode",
+            name: "Cycle thinking mode (fast/auto/always)",
+            callback: () => {
+                const next = thinkingMode === "fast" ? "auto" : thinkingMode === "auto" ? "always" : "fast";
+                this.setThinkingMode(next);
+            }
+        });
 
         this.settingsTab = new FastTyperSettingTab(this.app, this);
         this.addSettingTab(this.settingsTab);
 
         this.registerEditorExtension([
             grammarCorrectionsField,
+            processingField,
             grammarTooltip,
             grammarCheckerPlugin
         ]);
@@ -822,6 +966,14 @@ export default class FastTyperPlugin extends Plugin {
         this.settingsTab?.display();
     }
 
+    /** Select the thinking mode (`fast`/`auto`/`always`) and persist. */
+    async setThinkingMode(mode: "fast" | "auto" | "always") {
+        thinkingMode = mode;
+        await this.saveSettings();
+        this.settingsTab?.display();
+        new Notice(`FastTyper: thinking mode = ${mode}`);
+    }
+
     /** Set the custom system message (used with the Custom prompt) and persist. */
     async setCustomSystem(value: string) {
         customSystem = value;
@@ -836,7 +988,7 @@ export default class FastTyperPlugin extends Plugin {
 
     /** Persist the current settings to plugin data. */
     private async saveSettings() {
-        await this.saveData({ paused: correctionsPaused, capitalizeInitials, promptId, customSystem, customUser });
+        await this.saveData({ paused: correctionsPaused, capitalizeInitials, promptId, customSystem, customUser, thinkingMode });
     }
 
     /** Push the current pause state to every open editor's corrector instance. */

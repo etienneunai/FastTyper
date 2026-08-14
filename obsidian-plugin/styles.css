@@ -14,3 +14,20 @@
     opacity: 0.6;
     border-radius: 1px;
 }
+
+/* In-flight indicator: the unit currently being corrected (amber, distinct from
+   the blue applied `.grammar-applied-underline`). Pulses while thinking. */
+.ft-processing {
+    text-decoration: underline wavy #f59e0b;
+    text-decoration-skip-ink: none;
+    background-color: rgba(245, 158, 11, 0.12);
+}
+
+.ft-processing-thinking {
+    animation: ft-processing-pulse 1.2s ease-in-out infinite;
+}
+
+@keyframes ft-processing-pulse {
+    0%, 100% { opacity: 0.35; }
+    50% { opacity: 1; }
+}

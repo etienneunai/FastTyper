@@ -1,8 +1,7 @@
-import { App, MarkdownView, Notice, Plugin, PluginSettingTab, Setting } from 'obsidian';
+import { App, MarkdownView, Notice, Plugin, PluginSettingTab, Setting, requestUrl } from 'obsidian';
 import { StateField, StateEffect, Transaction, ChangeSet, type Range, type Text } from '@codemirror/state';
 import { Decoration, DecorationSet, EditorView, ViewPlugin, ViewUpdate, hoverTooltip, WidgetType } from '@codemirror/view';
 import { syntaxTree } from '@codemirror/language';
-import WORD_LIST from "./wordlist.json";
 
 interface AppliedCorrection {
     from: number;
@@ -18,8 +17,9 @@ interface DiffHunk {
     replacement: string;
 }
 
-const LLM_URL = "http://127.0.0.1:8808/v1/chat/completions";
-const MODEL = "dyslexic-writer-qwen3-4b-q4_k_m.gguf";
+let LLM_URL = "http://127.0.0.1:8808/v1/chat/completions";
+let LLM_BASE = "http://127.0.0.1:8808";
+let MODEL = "dyslexic-writer-qwen3-4b-q4_k_m.gguf";
 /** Wait after a trigger char insertion to make sure the user didn't delete it. */
 const TRIGGER_VERIFY_MS = 100;
 /** Skip units longer than this (sentences are short; keeps the 4B model's latency sane). */
@@ -71,22 +71,10 @@ const LLM_LOG_PATH = "/home/etienne/Projects/FastTyper/llm-log.txt";
 /** Common abbreviations whose trailing period is not a sentence end. */
 const ABBREVIATIONS = new Set(["e.g.", "i.e.", "etc.", "Mr.", "Mrs.", "Ms.", "Dr.", "St.", "vs.", "no."]);
 
-declare const require: (id: string) => any;
-
-let fsModule: any = null;
-/** Append one `sent:\n…\nreceived:\n…` exchange to LLM_LOG_PATH. */
+/** Log an exchange. (Disabled in production: cannot use node 'fs' in Obsidian plugins). */
 function logExchange(sent: string, received: string): void {
-    try {
-        if (fsModule === null) {
-            try { fsModule = require("fs"); } catch { fsModule = false; }
-        }
-        if (!fsModule) return;
-        const ts = new Date().toISOString();
-        const entry = `--- ${ts} ---\nsent:\n${sent}\nreceived:\n${received}\n\n`;
-        fsModule.appendFileSync(LLM_LOG_PATH, entry, "utf8");
-    } catch (e) {
-        console.error("FastTyper: failed to write LLM log", e);
-    }
+    // Logging to file system removed for store publishing.
+    // To restore for local debugging, use app.vault.adapter.append()
 }
 
 export const setCorrections = StateEffect.define<AppliedCorrection[]>();
@@ -202,12 +190,15 @@ export const processingField = StateField.define<{ from: number; to: number; thi
             if (state.from >= state.to) state = null; // unit deleted/collapsed mid-flight
         }
         for (const e of tr.effects) {
-            if (e.is(setProcessing)) state = e.value;
+            if (e.is(setProcessing)) {
+                if (e.value && e.value.from < e.value.to) state = e.value;
+                else state = null;
+            }
         }
         return state;
     },
     provide: (f) => EditorView.decorations.from(f, (s) =>
-        s
+        (s && s.from < s.to)
             ? Decoration.set([Decoration.mark({
                 class: s.thinking ? "ft-processing ft-processing-thinking" : "ft-processing"
             }).range(s.from, s.to)])
@@ -324,6 +315,7 @@ function isInstructionEcho(corrected: string): boolean {
 }
 
 const MAX_CHAR_DIFF_CELLS = 4_000_000;
+const diffBuffer = new Int32Array(MAX_CHAR_DIFF_CELLS + 2000);
 
 /**
  * Char-level LCS diff of two strings → minimal, ordered hunks `{from,to,replacement}`
@@ -334,7 +326,7 @@ function charDiff(a: string, b: string): DiffHunk[] {
     if (n * m > MAX_CHAR_DIFF_CELLS) return a === b ? [] : [{ from: 0, to: n, replacement: b }];
 
     const width = m + 1;
-    const dp = new Int32Array((n + 1) * width);
+    const dp = diffBuffer;
     for (let i = n - 1; i >= 0; i--) {
         for (let j = m - 1; j >= 0; j--) {
             dp[i * width + j] = a.charCodeAt(i) === b.charCodeAt(j)
@@ -385,8 +377,8 @@ function diffWords(a: string, b: string): DiffHunk[] {
 
 // Lazy ~275k-word Set; built on first use (~40 ms) so plugin load stays cheap.
 let _wordSet: Set<string> | null = null;
-function wordSet(): Set<string> {
-    if (_wordSet === null) _wordSet = new Set<string>(WORD_LIST);
+function wordSet() {
+    if (_wordSet === null) return new Set<string>(); // safe fallback before loaded
     return _wordSet;
 }
 
@@ -398,13 +390,15 @@ function wordSet(): Set<string> {
  * wordlist can't judge those). Lone lowercase "i" is a real typo for "I" and *is*
  * a dictionary word, so it's flagged explicitly.
  */
+const SUSPECT_REGEX = /[a-z]+(?:'[a-z]+)*/gi;
+
 function hasSuspectTokens(text: string): boolean {
-    const re = /[a-z]+(?:'[a-z]+)*/gi;
+    if (_wordSet === null) return false;
+    SUSPECT_REGEX.lastIndex = 0;
     let m: RegExpExecArray | null;
-    while ((m = re.exec(text)) !== null) {
+    while ((m = SUSPECT_REGEX.exec(text)) !== null) {
         const raw = m[0];
         if (/\d/.test(text[m.index - 1] ?? "") || /\d/.test(text[m.index + raw.length] ?? "")) continue;
-        if (/[A-Z]/.test(raw)) continue;       // proper noun / sentence start
         const token = raw.toLowerCase();
         if (token.includes("'")) continue;      // don't, it's, James'
         if (token.length === 1) { if (token === "i") return true; continue; }
@@ -541,6 +535,7 @@ const grammarCheckerPlugin = ViewPlugin.fromClass(class {
         // NOT count, so a line ending in an abbreviation still falls through to
         // the newline (line) trigger.
         if (ch === '\n') {
+            if (pos <= 0) return;
             const line = doc.lineAt(pos - 1);
             const lastNonWs = line.text.trimEnd();
             if (lastNonWs.length > 0) {
@@ -810,30 +805,27 @@ const grammarCheckerPlugin = ViewPlugin.fromClass(class {
                 reasoning_budget_message: "Stop reasoning and answer now."
             } : {})
         };
-        const body = JSON.stringify(payload);
 
-        const response = await fetch(LLM_URL, {
+        const response = await requestUrl({
+            url: LLM_URL,
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body,
-            signal
+            body: JSON.stringify(payload),
+            throw: false,
         });
-        const rawBody = await response.text();
-        logExchange(body, rawBody);
 
-        if (!response.ok) {
+        if (response.status !== 200) {
             console.error("FastTyper: daemon returned", response.status);
             return null;
         }
-        let data: any;
-        try {
-            data = JSON.parse(rawBody);
-        } catch (e) {
+
+        const data = response.json;
+        if (!data?.choices?.[0]?.message?.content) {
+            console.error("FastTyper: unparseable response");
             return null;
         }
-        const content: unknown = data?.choices?.[0]?.message?.content;
-        if (typeof content !== "string") return null;
 
+        const content = data.choices[0].message.content;
         const corrected = parseResponse(content);
         if (!corrected) return null;
         // Echo guards: (1) the model must not repeat the instruction back (the v4
@@ -882,6 +874,46 @@ class FastTyperSettingTab extends PluginSettingTab {
     display() {
         const { containerEl } = this;
         containerEl.empty();
+
+        const statusSetting = new Setting(containerEl)
+            .setName("Daemon status")
+            .setDesc("Checking connection...");
+        
+        const checkStatus = async () => {
+            try {
+                const res = await requestUrl({ url: `${LLM_BASE}/v1/models` });
+                if (res.status === 200) {
+                    statusSetting.setDesc("🟢 Connected to daemon");
+                } else {
+                    statusSetting.setDesc(`🔴 Daemon error: HTTP ${res.status}`);
+                }
+            } catch (e) {
+                statusSetting.setDesc("🔴 Disconnected (daemon not running or unreachable)");
+            }
+        };
+        checkStatus();
+
+        new Setting(containerEl)
+            .setName("LLM Base URL")
+            .setDesc("The base URL of the llama.cpp daemon.")
+            .addText(text => text
+                .setValue(LLM_BASE)
+                .onChange(async (value) => {
+                    LLM_BASE = value;
+                    LLM_URL = `${value}/v1/chat/completions`;
+                    await this.plugin.saveSettings();
+                    checkStatus();
+                }));
+        
+        new Setting(containerEl)
+            .setName("Model Name")
+            .setDesc("The exact filename or identifier of the loaded model.")
+            .addText(text => text
+                .setValue(MODEL)
+                .onChange(async (value) => {
+                    MODEL = value;
+                    await this.plugin.saveSettings();
+                }));
 
         new Setting(containerEl)
             .setName("Pause corrections")
@@ -958,6 +990,14 @@ export default class FastTyperPlugin extends Plugin {
         if (typeof data?.customSystem === "string") customSystem = data.customSystem;
         if (typeof data?.customUser === "string") customUser = data.customUser;
         if (data?.thinkingMode === "fast" || data?.thinkingMode === "auto" || data?.thinkingMode === "always") thinkingMode = data.thinkingMode;
+        if (typeof data?.llmUrl === "string") LLM_URL = data.llmUrl;
+        if (typeof data?.llmBase === "string") LLM_BASE = data.llmBase;
+        if (typeof data?.model === "string") MODEL = data.model;
+
+        // Async load wordlist to prevent blocking startup
+        this.app.vault.adapter.read(`${this.manifest.dir}/wordlist.json`).then(
+            text => _wordSet = new Set(JSON.parse(text))
+        ).catch(e => console.error("FastTyper: failed to load wordlist", e));
 
         this.addCommand({
             id: "accept-all-corrections",
@@ -1048,8 +1088,8 @@ export default class FastTyperPlugin extends Plugin {
     }
 
     /** Persist the current settings to plugin data. */
-    private async saveSettings() {
-        await this.saveData({ paused: correctionsPaused, capitalizeInitials, promptId, customSystem, customUser, thinkingMode });
+    async saveSettings() {
+        await this.saveData({ paused: correctionsPaused, capitalizeInitials, promptId, customSystem, customUser, thinkingMode, llmUrl: LLM_URL, llmBase: LLM_BASE, model: MODEL });
     }
 
     /** Push the current pause state to every open editor's corrector instance. */

@@ -3,8 +3,8 @@
   "name": "FastTyper",
   "version": "0.2.0",
   "description": "Real-time grammar correction in web text fields, powered by a local llama.cpp daemon.",
-  "permissions": ["storage"],
-  "host_permissions": ["http://127.0.0.1:8808/*"],
+  "permissions": ["storage", "tabs"],
+  "host_permissions": ["<all_urls>"],
   "background": {
     "scripts": ["background.js"]
   },

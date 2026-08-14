@@ -22,7 +22,7 @@ async function refresh(): Promise<void> {
   const status = $("status");
   status.textContent =
     st.daemonUp === true
-      ? "Daemon: connected (127.0.0.1:8808)"
+      ? "Daemon: connected (" + st.llmBase + ")"
       : st.daemonUp === null
         ? "Daemon: not reachable — is the fasttyper service running?"
         : "Daemon: error";

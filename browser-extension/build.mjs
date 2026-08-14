@@ -20,7 +20,7 @@ const options = [
 ];
 
 // Static assets copied verbatim into dist/.
-const statics = ["manifest.json", "popup.html", "content.css", "styles.css"];
+const statics = ["manifest.json", "popup.html", "content.css", "styles.css", "wordlist.json"];
 
 function copyStatics() {
   mkdirSync("dist", { recursive: true });

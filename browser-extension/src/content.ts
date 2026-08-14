@@ -23,7 +23,7 @@
 import {
   TRIGGER_VERIFY_MS, MAX_UNIT_CHARS, MIN_UNIT_CHARS, ABBREVIATIONS,
   diffWords, capitalizeInitial, contextSnippet,
-  type DiffHunk, type PushMsg, type ThinkingMode,
+  type DiffHunk, type PushMsg, type ThinkingMode, type Response
 } from "./shared";
 
 // Google Docs is canvas-rendered; the visible text isn't DOM text nodes.
@@ -298,7 +298,13 @@ class ContentEditableField implements Field {
   el: HTMLElement;
   kind: "contenteditable" = "contenteditable";
   constructor(el: HTMLElement) { this.el = el; }
-  private model(): ContentModel { return buildModel(this.el); }
+  private _cachedModel: ContentModel | null = null;
+  private model(): ContentModel {
+    if (this._cachedModel) return this._cachedModel;
+    this._cachedModel = buildModel(this.el);
+    queueMicrotask(() => { this._cachedModel = null; });
+    return this._cachedModel;
+  }
   readText(): string { return this.model().text; }
   caret(): number { return modelCaret(this.el, this.model()); }
   setCaret(pos: number): void { setModelCaret(this.el, this.model(), pos); }
@@ -530,7 +536,22 @@ class Corrector {
         if (this.gen !== g || paused || active !== q.field) return;
         if (!corrected) return;
 
+        const rawCorrected = corrected;
         const final = capitalizeInitial(corrected, capitalize);
+        const noOp = rawCorrected === trimmed;
+
+        if (thinkingMode === "auto" && !thinking) {
+          const res1 = (await browser.runtime.sendMessage({ type: "checkSuspects", text: trimmed })) as Response;
+          const suspects = res1.type === "checkSuspectsResult" ? res1.suspects : false;
+          const res2 = (!noOp) ? ((await browser.runtime.sendMessage({ type: "checkSuspects", text: rawCorrected })) as Response) : null;
+          const leftover = res2?.type === "checkSuspectsResult" ? res2.suspects : false;
+          if (noOp ? suspects : leftover) {
+            continue; // escalate to thinking on original text
+          }
+        }
+        
+        if (noOp && final === trimmed) return; // no change at all
+
         if (final !== trimmed) {
           // The user edited the unit while we waited — never insert stale text.
           if (q.field.readText().slice(q.from, q.to).trim() !== trimmed) return;
@@ -538,14 +559,11 @@ class Corrector {
           if (hunks.length > 0) applyHunks(q.field, q.from, lead, trimmed, hunks);
           return;
         }
-        // Flat no-op in "auto" → escalate once (next iteration). Otherwise done.
-        if (thinkingMode !== "auto" || attempt > 0) return;
-        if (q.field.readText().slice(q.from, q.to).trim() !== trimmed) return; // edited → abandon
+        return;
       }
     } finally {
       hideProcessingPill();
       this.isPending = false;
-      this.queued = null;
       this.maybeFire();
     }
   }
@@ -698,10 +716,14 @@ function applyHunks(field: Field, spanStart: number, lead: number, trimmed: stri
     const text = field.readText();
     const changes = hunks.map((h) => ({ from: base + h.from, to: base + h.to, ins: h.replacement }));
     const caretBefore = field.caret();
-    let v = text;
-    for (const c of [...changes].sort((a, b) => b.from - a.from)) {
-      v = v.slice(0, c.from) + c.ins + v.slice(c.to);
+    let v = "";
+    let last = 0;
+    const sortedChanges = [...changes].sort((a, b) => a.from - b.from);
+    for (const c of sortedChanges) {
+      v += text.slice(last, c.from) + c.ins;
+      last = c.to;
     }
+    v += text.slice(last);
     field.setValue(v);
     field.setCaret(mapCaret(caretBefore, changes));
     showCorrectionPill(field, base, trimmed, hunks);

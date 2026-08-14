@@ -478,6 +478,20 @@ var grammarCheckerPlugin = import_view.ViewPlugin.fromClass(class {
       if (prev && ABBREVIATIONS.has(prev))
         return;
     }
+    if (ch === "\n") {
+      const line = doc.lineAt(pos - 1);
+      const lastNonWs = line.text.trimEnd();
+      if (lastNonWs.length > 0) {
+        const lastCh = lastNonWs[lastNonWs.length - 1];
+        if (lastCh === "?" || lastCh === "!")
+          return;
+        if (lastCh === ".") {
+          const prev = this.prevToken(line.from + lastNonWs.length - 1);
+          if (!(prev && ABBREVIATIONS.has(prev)))
+            return;
+        }
+      }
+    }
     const span = ch === "\n" ? this.lineSpan(pos) : this.sentenceSpan(pos);
     if (!span)
       return;

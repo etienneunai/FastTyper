@@ -535,6 +535,24 @@ const grammarCheckerPlugin = ViewPlugin.fromClass(class {
             if (prev && ABBREVIATIONS.has(prev)) return;
         }
 
+        // A newline must not re-trigger a line whose terminating punctuation
+        // already fired the sentence trigger (avoids double-processing a line
+        // that ends with . ? !). Reuse the same abbreviation rule: "e.g." does
+        // NOT count, so a line ending in an abbreviation still falls through to
+        // the newline (line) trigger.
+        if (ch === '\n') {
+            const line = doc.lineAt(pos - 1);
+            const lastNonWs = line.text.trimEnd();
+            if (lastNonWs.length > 0) {
+                const lastCh = lastNonWs[lastNonWs.length - 1];
+                if (lastCh === '?' || lastCh === '!') return;
+                if (lastCh === '.') {
+                    const prev = this.prevToken(line.from + lastNonWs.length - 1);
+                    if (!(prev && ABBREVIATIONS.has(prev))) return;
+                }
+            }
+        }
+
         const span = ch === '\n' ? this.lineSpan(pos) : this.sentenceSpan(pos);
         if (!span) return;
         if (span.to - span.from > MAX_UNIT_CHARS) return;

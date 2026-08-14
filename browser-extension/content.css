@@ -64,6 +64,19 @@
 }
 .ft-pill-x:hover { background: rgba(255, 255, 255, 0.15); }
 
+/* In-flight status pill: shows while a correction request is in flight (amber). */
+.ft-pill-processing {
+  align-items: center;
+  color: #fde68a;
+  background: rgba(120, 72, 0, 0.92);
+  padding: 4px 12px;
+  animation: ft-processing-pulse 1.2s ease-in-out infinite;
+}
+@keyframes ft-processing-pulse {
+  0%, 100% { opacity: 0.6; }
+  50% { opacity: 1; }
+}
+
 /* Hover tooltip over an applied correction in contenteditable editors. */
 .ft-tooltip {
   position: fixed;

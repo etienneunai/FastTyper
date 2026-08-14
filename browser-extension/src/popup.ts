@@ -14,6 +14,7 @@ async function refresh(): Promise<void> {
   ($("paused") as HTMLInputElement).checked = st.paused;
   ($("capitalize") as HTMLInputElement).checked = st.capitalize;
   ($("prompt") as HTMLSelectElement).value = st.promptId;
+  ($("thinkingMode") as HTMLSelectElement).value = st.thinkingMode;
   ($("customSystem") as HTMLTextAreaElement).value = st.customSystem;
   ($("customUser") as HTMLTextAreaElement).value = st.customUser;
   toggleCustom(st.promptId);
@@ -38,6 +39,10 @@ async function refresh(): Promise<void> {
   const id = (e.target as HTMLSelectElement).value;
   toggleCustom(id);
   void browser.runtime.sendMessage({ type: "setPrompt", promptId: id });
+});
+($("thinkingMode") as HTMLSelectElement).addEventListener("change", (e) => {
+  const mode = (e.target as HTMLSelectElement).value as "fast" | "auto" | "always";
+  void browser.runtime.sendMessage({ type: "setThinkingMode", thinkingMode: mode });
 });
 ($("customSystem") as HTMLTextAreaElement).addEventListener("input", (e) => {
   void browser.runtime.sendMessage({ type: "setCustomSystem", value: (e.target as HTMLTextAreaElement).value });

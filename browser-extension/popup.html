@@ -16,6 +16,12 @@
     <option value="C">C — clean</option>
     <option value="custom">Custom</option>
   </select>
+  <label for="thinkingMode" class="bl-label">Thinking mode</label>
+  <select id="thinkingMode" class="sel">
+    <option value="fast">Fast — flat only</option>
+    <option value="auto">Auto — flat, then E+thinking on a miss</option>
+    <option value="always">Always — E+thinking every request</option>
+  </select>
   <div id="customPrompts" hidden>
     <label for="customSystem" class="bl-label">Custom system prompt</label>
     <textarea id="customSystem" rows="2" placeholder="You are a spelling correction assistant."></textarea>

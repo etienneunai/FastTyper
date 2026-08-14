@@ -8,7 +8,7 @@
  */
 import {
   buildPayload, LLM_URL, LLM_BASE, parseResponse, resolvePrompt, PROMPT_PRESETS,
-  type Request, type Response, type LogEntry, type PushMsg,
+  type Request, type Response, type LogEntry, type PushMsg, type ThinkingMode,
 } from "./shared";
 
 const LOG_KEY = "llmLog";
@@ -25,6 +25,8 @@ interface Settings {
   customSystem: string;
   /** Custom user-message template with `{text}` (used when `promptId === "custom"`). */
   customUser: string;
+  /** Thinking mode: "fast" flat only · "auto" flat then E+thinking on a no-op · "always" E+thinking every request. */
+  thinkingMode: ThinkingMode;
 }
 
 const DEFAULT_SETTINGS: Settings = {
@@ -34,6 +36,7 @@ const DEFAULT_SETTINGS: Settings = {
   promptId: "A",
   customSystem: PROMPT_PRESETS[0].system,
   customUser: PROMPT_PRESETS[0].user,
+  thinkingMode: "auto",
 };
 
 async function getSettings(): Promise<Settings> {
@@ -43,7 +46,7 @@ async function getSettings(): Promise<Settings> {
 
 async function saveSettings(s: Settings): Promise<void> {
   await browser.storage.local.set({ [SETTINGS_KEY]: s });
-  await broadcast({ type: "settings", paused: s.paused, capitalize: s.capitalize, blacklist: s.blacklist });
+  await broadcast({ type: "settings", paused: s.paused, capitalize: s.capitalize, blacklist: s.blacklist, thinkingMode: s.thinkingMode });
 }
 
 async function broadcast(msg: PushMsg): Promise<void> {
@@ -68,9 +71,9 @@ async function getLog(): Promise<LogEntry[]> {
 }
 
 /** POST a sentence to the daemon → the corrected text (or null). */
-async function correct(text: string, url?: string): Promise<string | null> {
+async function correct(text: string, thinking: boolean, url?: string): Promise<string | null> {
   const s = await getSettings();
-  const body = JSON.stringify(buildPayload(text, resolvePrompt(s.promptId, s.customSystem, s.customUser)));
+  const body = JSON.stringify(buildPayload(text, resolvePrompt(s.promptId, s.customSystem, s.customUser), thinking));
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 30_000);
   try {
@@ -122,7 +125,7 @@ browser.runtime.onMessage.addListener(
   (msg: Request, sender): Promise<Response> => {
     switch (msg.type) {
       case "correct":
-        return correct(msg.text, sender.tab?.url).then(
+        return correct(msg.text, msg.thinking, sender.tab?.url).then(
           (corrected): Response => ({ type: "correctResult", corrected })
         );
 
@@ -173,9 +176,16 @@ browser.runtime.onMessage.addListener(
           )
         );
 
+      case "setThinkingMode":
+        return getSettings().then((s) =>
+          saveSettings({ ...s, thinkingMode: msg.thinkingMode }).then(
+            (): Response => ({ type: "correctResult", corrected: null })
+          )
+        );
+
       case "getState":
         return Promise.all([getSettings(), daemonUp()]).then(
-          ([s, up]): Response => ({ type: "state", paused: s.paused, capitalize: s.capitalize, blacklist: s.blacklist, promptId: s.promptId, customSystem: s.customSystem, customUser: s.customUser, daemonUp: up })
+          ([s, up]): Response => ({ type: "state", paused: s.paused, capitalize: s.capitalize, blacklist: s.blacklist, promptId: s.promptId, customSystem: s.customSystem, customUser: s.customUser, thinkingMode: s.thinkingMode, daemonUp: up })
         );
 
       case "getLog":

@@ -23,7 +23,7 @@
 import {
   TRIGGER_VERIFY_MS, MAX_UNIT_CHARS, MIN_UNIT_CHARS, ABBREVIATIONS,
   diffWords, capitalizeInitial, contextSnippet,
-  type DiffHunk, type PushMsg,
+  type DiffHunk, type PushMsg, type ThinkingMode,
 } from "./shared";
 
 // Google Docs is canvas-rendered; the visible text isn't DOM text nodes.
@@ -38,6 +38,8 @@ let paused = false;
 let capitalize = true;
 /** Hostnames (or subdomains of them) where FastTyper is disabled. */
 let blacklist: string[] = [];
+/** Thinking mode: "fast" flat only · "auto" flat then E+thinking on a no-op · "always" E+thinking every request. */
+let thinkingMode: ThinkingMode = "auto";
 /** True when the current page's hostname is blacklisted. */
 let siteDisabled = false;
 
@@ -63,11 +65,12 @@ function applySiteState(): void {
 }
 
 browser.storage.local.get("settings").then((got) => {
-  const s = got.settings as { paused?: boolean; capitalize?: boolean; blacklist?: string[] } | undefined;
+  const s = got.settings as { paused?: boolean; capitalize?: boolean; blacklist?: string[]; thinkingMode?: ThinkingMode } | undefined;
   if (s) {
     paused = !!s.paused;
     capitalize = s.capitalize !== false;
     if (Array.isArray(s.blacklist)) blacklist = s.blacklist;
+    if (s.thinkingMode === "fast" || s.thinkingMode === "auto" || s.thinkingMode === "always") thinkingMode = s.thinkingMode;
   }
   applySiteState();
 });
@@ -77,6 +80,7 @@ browser.runtime.onMessage.addListener((msg: PushMsg) => {
     paused = msg.paused;
     capitalize = msg.capitalize;
     if (Array.isArray(msg.blacklist)) blacklist = msg.blacklist;
+    if (msg.thinkingMode === "fast" || msg.thinkingMode === "auto" || msg.thinkingMode === "always") thinkingMode = msg.thinkingMode;
     if (paused) corrector.reset();
     applySiteState();
   } else if (msg.type === "acceptAll") {
@@ -428,6 +432,7 @@ class Corrector {
   /** Drop in-flight/queued/verify work (pause, field switch). */
   reset(): void {
     this.gen++;
+    hideProcessingPill();
     if (this.verifyTimer) clearTimeout(this.verifyTimer);
     this.verifyTimer = null;
     this.verifyPos = null;
@@ -504,6 +509,7 @@ class Corrector {
   private async fire(q: QueuedUnit): Promise<void> {
     this.isPending = true;
     const g = this.gen;
+    showProcessingPill(q.field, thinkingMode === "always");
     try {
       if (this.gen !== g || paused || active !== q.field) return;
       const text = q.field.readText();
@@ -513,27 +519,39 @@ class Corrector {
       if (trimmed.length < MIN_UNIT_CHARS) return;
       if (looksLikeCode(trimmed)) return;
 
-      const corrected = await this.request(trimmed);
-      if (this.gen !== g || paused || active !== q.field) return;
-      if (!corrected) return;
+      // "auto" tries flat once, then escalates to E + thinking ONLY if flat
+      // changed nothing. A thinking no-op is final (thinking is non-deterministic
+      // at temperature 0 — never loop it). "always" goes straight to thinking.
+      const maxAttempts = thinkingMode === "auto" ? 2 : 1;
+      for (let attempt = 0; attempt < maxAttempts; attempt++) {
+        const thinking = thinkingMode === "always" || attempt === 1;
+        if (thinking) updateProcessingPill(q.field, true);
+        const corrected = await this.request(trimmed, thinking);
+        if (this.gen !== g || paused || active !== q.field) return;
+        if (!corrected) return;
 
-      const final = capitalizeInitial(corrected, capitalize);
-      if (final === trimmed) return;
-
-      // The user edited the unit while we waited — never insert stale text.
-      if (q.field.readText().slice(q.from, q.to).trim() !== trimmed) return;
-
-      const hunks = diffWords(trimmed, final);
-      if (hunks.length > 0) applyHunks(q.field, q.from, lead, trimmed, hunks);
+        const final = capitalizeInitial(corrected, capitalize);
+        if (final !== trimmed) {
+          // The user edited the unit while we waited — never insert stale text.
+          if (q.field.readText().slice(q.from, q.to).trim() !== trimmed) return;
+          const hunks = diffWords(trimmed, final);
+          if (hunks.length > 0) applyHunks(q.field, q.from, lead, trimmed, hunks);
+          return;
+        }
+        // Flat no-op in "auto" → escalate once (next iteration). Otherwise done.
+        if (thinkingMode !== "auto" || attempt > 0) return;
+        if (q.field.readText().slice(q.from, q.to).trim() !== trimmed) return; // edited → abandon
+      }
     } finally {
+      hideProcessingPill();
       this.isPending = false;
       this.queued = null;
       this.maybeFire();
     }
   }
 
-  private async request(text: string): Promise<string | null> {
-    const resp = await browser.runtime.sendMessage({ type: "correct", text });
+  private async request(text: string, thinking: boolean): Promise<string | null> {
+    const resp = await browser.runtime.sendMessage({ type: "correct", text, thinking });
     return resp && resp.type === "correctResult" ? resp.corrected : null;
   }
 }
@@ -865,6 +883,37 @@ function undoPill(pill: HTMLElement): void {
 
 function dismissAllPills(): void {
   for (const p of [...pills]) removePill(p.el);
+  hideProcessingPill();
+}
+
+// --- in-flight status pill ---
+let processingPill: { el: HTMLElement; field: Field } | null = null;
+
+/** Transient "FastTyper…" status pill while a correction request is in flight. */
+function showProcessingPill(field: Field, thinking: boolean): void {
+  hideProcessingPill();
+  const el = document.createElement("div");
+  el.className = "ft-pill ft-pill-processing";
+  const label = document.createElement("span");
+  label.textContent = thinking ? "FastTyper… thinking…" : "FastTyper…";
+  el.appendChild(label);
+  document.body.appendChild(el);
+  processingPill = { el, field };
+  positionPill(el, field.el);
+}
+
+/** Flip the in-flight pill's label when the request escalates to thinking. */
+function updateProcessingPill(field: Field, thinking: boolean): void {
+  if (!processingPill || processingPill.field !== field) return;
+  const label = processingPill.el.querySelector("span");
+  if (label) label.textContent = thinking ? "FastTyper… thinking…" : "FastTyper…";
+}
+
+function hideProcessingPill(): void {
+  if (processingPill) {
+    processingPill.el.remove();
+    processingPill = null;
+  }
 }
 
 // --- contenteditable hover tooltip ---

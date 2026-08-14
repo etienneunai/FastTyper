@@ -16,6 +16,16 @@ export const TRIGGER_VERIFY_MS = 100;
 export const MAX_UNIT_CHARS = 800;
 export const MIN_UNIT_CHARS = 3;
 
+/**
+ * Thinking mode: "fast" = flat inference only; "auto" = flat first, escalate
+ * once to E + thinking only if flat changes nothing; "always" = E + thinking
+ * on every request. Mirrors the Obsidian plugin's `thinkingMode`.
+ */
+export type ThinkingMode = "fast" | "auto" | "always";
+
+/** Per-request reasoning-budget cap (tokens) — the eval's runaway-prevention fix. */
+export const THINKING_BUDGET = 256;
+
 /** Common abbreviations whose trailing period is not a sentence end. */
 export const ABBREVIATIONS = new Set([
   "e.g.", "i.e.", "etc.", "Mr.", "Mrs.", "Ms.", "Dr.", "St.", "vs.", "no.",
@@ -194,8 +204,14 @@ export function resolvePrompt(promptId: string, customSystem: string, customUser
 // LLM payload (ported from main.ts request())
 // ---------------------------------------------------------------------------
 
-/** The body sent to the daemon. `text` is the bare sentence/line, already trimmed. */
-export function buildPayload(text: string, prompt: ActivePrompt): Record<string, unknown> {
+/**
+ * The body sent to the daemon. `text` is the bare sentence/line, already trimmed.
+ * When `thinking` is true the request uses the E (proof) preset with Qwen3
+ * thinking enabled and a reasoning_budget_tokens cap — the config the eval
+ * matrix proved fixes the hard dyslexic cases that flat inference leaves
+ * unchanged. Keep in sync with obsidian-plugin/src/main.ts request().
+ */
+export function buildPayload(text: string, prompt: ActivePrompt, thinking: boolean): Record<string, unknown> {
   return {
     model: MODEL,
     messages: [
@@ -203,10 +219,9 @@ export function buildPayload(text: string, prompt: ActivePrompt): Record<string,
       { role: "user", content: prompt.user.split("{text}").join(text) },
     ],
     temperature: 0,
-    max_tokens: Math.min(2048, Math.ceil(text.length / 3) + 256),
-    // Force-disable Qwen3 thinking mode (template enable_thinking=false).
-    // Keep in sync with obsidian-plugin/src/main.ts request().
-    chat_template_kwargs: { enable_thinking: false },
+    max_tokens: thinking ? 2048 : Math.min(2048, Math.ceil(text.length / 3) + 256),
+    chat_template_kwargs: { enable_thinking: thinking },
+    ...(thinking ? { reasoning_budget_tokens: THINKING_BUDGET } : {}),
   };
 }
 
@@ -215,7 +230,7 @@ export function buildPayload(text: string, prompt: ActivePrompt): Record<string,
 // ---------------------------------------------------------------------------
 
 export type Request =
-  | { type: "correct"; text: string }
+  | { type: "correct"; text: string; thinking: boolean }
   | { type: "acceptAll" }
   | { type: "getState" }
   | { type: "setPaused"; paused: boolean }
@@ -224,11 +239,12 @@ export type Request =
   | { type: "setCustomSystem"; value: string }
   | { type: "setCustomUser"; value: string }
   | { type: "setBlacklist"; blacklist: string[] }
+  | { type: "setThinkingMode"; thinkingMode: ThinkingMode }
   | { type: "getLog" };
 
 export type Response =
   | { type: "correctResult"; corrected: string | null }
-  | { type: "state"; paused: boolean; capitalize: boolean; blacklist: string[]; daemonUp: boolean | null; promptId: string; customSystem: string; customUser: string }
+  | { type: "state"; paused: boolean; capitalize: boolean; blacklist: string[]; daemonUp: boolean | null; promptId: string; customSystem: string; customUser: string; thinkingMode: ThinkingMode }
   | { type: "log"; entries: string[] };
 
 export interface LogEntry {
@@ -240,5 +256,5 @@ export interface LogEntry {
 
 /** Push-to-content-script settings/command messages (not request/response). */
 export type PushMsg =
-  | { type: "settings"; paused: boolean; capitalize: boolean; blacklist: string[] }
+  | { type: "settings"; paused: boolean; capitalize: boolean; blacklist: string[]; thinkingMode: ThinkingMode }
   | { type: "acceptAll" };

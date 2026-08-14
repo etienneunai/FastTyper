@@ -1,0 +1,35 @@
+/* FastTyper popup styles. */
+body {
+  width: 300px;
+  margin: 0;
+  padding: 12px;
+  font: 13px/1.5 system-ui, sans-serif;
+  color: #111;
+}
+h1 { font-size: 15px; margin: 0 0 10px; }
+.row { display: flex; align-items: center; gap: 8px; margin: 6px 0; }
+.btn {
+  width: 100%;
+  margin-top: 8px;
+  padding: 6px;
+  color: #fff;
+  background: #3b82f6;
+  border: none;
+  border-radius: 6px;
+  cursor: pointer;
+}
+.btn:hover { background: #2563eb; }
+.status { margin-top: 10px; font-size: 12px; }
+.status.ok { color: #16a34a; }
+.status.bad { color: #dc2626; }
+details { margin-top: 10px; }
+pre {
+  max-height: 180px;
+  overflow: auto;
+  padding: 6px;
+  font-size: 10px;
+  white-space: pre-wrap;
+  word-break: break-all;
+  background: #f6f8fa;
+  border-radius: 6px;
+}

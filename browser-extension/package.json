@@ -1,0 +1,16 @@
+{
+  "name": "fasttyper-browser-extension",
+  "version": "0.1.0",
+  "description": "FastTyper Firefox extension: local grammar correction in web text fields.",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "node build.mjs && tsc --noEmit",
+    "watch": "node build.mjs --watch"
+  },
+  "devDependencies": {
+    "@types/firefox-webext-browser": "^143.0.0",
+    "esbuild": "^0.24.0",
+    "typescript": "^5.6.0"
+  }
+}

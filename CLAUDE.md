@@ -26,9 +26,15 @@ An Obsidian plugin providing real-time text replacement and visual indicators.
 * **Plugin id**: `fasttyper` (folder + manifest id; update `community-plugins.json` accordingly).
 * **LLM Request Log**: Every exchange is appended to `/home/etienne/Projects/FastTyper/llm-log.txt` as `--- <ISO timestamp> ---\nsent:\n…\nreceived:\n…\n\n` blocks (the full JSON payload sent and the raw response body). Implemented in `logExchange()` in `src/main.ts`, which uses a lazy `require("fs")` — Obsidian's Electron renderer has Node integration and the esbuild config externalizes Node builtins, so the plugin can write outside the vault. The path is hardcoded via `LLM_LOG_PATH` (adjust if the repo moves). Non-abort fetch errors are also logged with the sent body.
 
-### 3. `fcitx5-proxy/` (System-Wide Wayland Fallback)
-*(Not implemented — scaffolding only. Do not rely on it.)*
-A Python file (`fasttyper-proxy.py`) that sketches a DBus proxy for Fcitx5. It makes no DBus calls and its design premise (globally intercepting typed text over Fcitx5's DBus API) is not achievable — Wayland text interception requires the input-method protocol (`zwp_input_method_v2`). Treat as an idea, not a component.
+### 3. `browser-extension/` (Firefox Web Extension — universal web correction)
+A Firefox MV3 extension that corrects typos in **any web text field**, reusing the exact engine from the Obsidian plugin. It's the same trigger → correct → diff → apply → revert pipeline ported onto the DOM, hitting the same `127.0.0.1:8808` daemon (no backend changes).
+* **`src/shared.ts`**: The dependency-free engine ported from `obsidian-plugin/src/main.ts` — `parseResponse`, `charDiff`/`diffWords` (LCS), `capitalizeInitial`, `contextSnippet`, abbreviation set, `MAX_UNIT_CHARS`/`MIN_UNIT_CHARS`/`TRIGGER_VERIFY_MS`/`MAX_RETRIES`, `buildPayload`. **Keep the two copies in sync when you change engine logic.**
+* **`src/background.ts`**: All daemon traffic goes through here — with `host_permissions` for `127.0.0.1:8808`, the background context can fetch localhost without the page's CORS policy (a content script cannot). Also owns settings (`storage.local`), the daemon-health probe, the `Ctrl+Shift+F` pause command, and a 50-entry exchange-log ring buffer (a browser extension has no filesystem access, so there is **no `llm-log.txt`** — log is viewable in the popup).
+* **`src/content.ts`**: Content script. Editable-field registry via capture-phase `focusin`/`beforeinput`/`input`; trigger detection requires a **trusted** input event whose `inputType` is `insertText`/`insertLineBreak`/`insertParagraph` and checks `isComposing` so IME composition is never clobbered. `beforeinput` snapshots the caret so only a *fresh* trigger insertion fires. Applies edits via the **native value setter** + `InputEvent` dispatch (so React-controlled inputs stay in sync) for textareas, and `execCommand('insertText')` (native-undo integration) + text-node wrap for contenteditable.
+* **Skipped fields**: `input[type!=text]` (password/email/number/…), read-only/disabled, login/username/password/credential attribute heuristics, and **complex editors** — Google Docs (hostname guard: canvas-rendered), and mirrored-hidden-textareas (CodeMirror/Monaco/Notion-style) detected via `opacity:0`/zero-size rect or `.cm-editor`/`.monaco-editor`/`.kix` ancestry. Their visible text isn't DOM text, so inline spans would be wrong.
+* **Revert UX**: contenteditable corrections get a wavy-underline `ft-correction` span + hover tooltip ("…before[original]after… — click to revert") and are undoable via Ctrl+Z (execCommand). Plain textareas **cannot** show inline markup and programmatic value changes aren't in the native undo stack, so they get a transient `ft-pill` near the field with an explicit Undo button instead. Zero-width deletions apply but get no marker in v1.
+* **V1 simplifications**: spans are not mapped through subsequent user edits — on conflict the unit is re-sent (≤`MAX_RETRIES`) with the same offsets, mirroring the plugin's resend-on-conflict. Google Docs/CodeMirror/Monaco integration is deliberately out of scope (would require reverse-engineering the editor's private model).
+* **Build**: `npm run build` in `browser-extension/` bundles `content`/`background`/`popup` via esbuild into `dist/` (also copies `manifest.json`, `content.css`, `styles.css`, `popup.html`) and runs `tsc --noEmit`. Load via Firefox `about:debugging` → Load Temporary Add-on → `dist/manifest.json`.
 
 ## Development Workflow
 
@@ -49,7 +55,16 @@ A Python file (`fasttyper-proxy.py`) that sketches a DBus proxy for Fcitx5. It m
   ```
   Reload Obsidian (or restart) to pick up the plugin.
 
-* **Viewing the LLM exchange log**: `tail -f llm-log.txt` in the repo root. Each request appears once the response returns; aborted/stale requests are skipped.
+* **Viewing the LLM exchange log**: `tail -f llm-log.txt` in the repo root. Each request appears once the response returns; aborted/stale requests are skipped. (Obsidian plugin only — the browser extension logs to `storage.local`, viewable in its popup.)
+
+* **Building the Browser Extension**:
+  ```bash
+  cd browser-extension
+  # (Initial setup: npm install)
+  npm run build
+  # Load in Firefox: about:debugging#/runtime/this-firefox → Load Temporary Add-on → dist/manifest.json
+  ```
+  Keep `src/shared.ts` (the ported engine) in sync with `obsidian-plugin/src/main.ts` — engine changes should land in both.
 
 ## AI & Prompt Details
 The model (`dyslexic-writer-qwen3-4b`) outputs **full corrected text**, not JSON. The plugin sends:

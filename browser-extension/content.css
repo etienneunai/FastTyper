@@ -1,0 +1,54 @@
+/* FastTyper content-script styles — ported from the Obsidian plugin's styles.css. */
+
+.ft-correction {
+  text-decoration: underline wavy #3b82f6;
+  text-decoration-skip-ink: none;
+  background-color: rgba(59, 130, 246, 0.12);
+  border-radius: 2px;
+  cursor: pointer;
+}
+
+/* Transient indicator pill for plain textareas (no inline markup possible). */
+.ft-pill {
+  position: fixed;
+  z-index: 2147483647;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 360px;
+  padding: 6px 8px;
+  font: 12px/1.4 system-ui, sans-serif;
+  color: #fff;
+  background: rgba(20, 26, 40, 0.94);
+  border-radius: 6px;
+  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.25);
+}
+
+.ft-pill-btn {
+  padding: 1px 7px;
+  font: 12px/1.4 system-ui, sans-serif;
+  color: #fff;
+  background: #3b82f6;
+  border: none;
+  border-radius: 4px;
+  cursor: pointer;
+}
+.ft-pill-btn:hover { background: #2563eb; }
+
+/* Hover tooltip over an applied correction in contenteditable editors. */
+.ft-tooltip {
+  position: fixed;
+  z-index: 2147483647;
+  display: none;
+  max-width: 360px;
+  padding: 6px 10px;
+  font: 12px/1.4 system-ui, sans-serif;
+  color: #111;
+  background: #fff;
+  border: 1px solid #d0d7de;
+  border-radius: 5px;
+  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.18);
+  cursor: pointer;
+}
+.ft-tooltip strong { color: #2563eb; }
+.ft-tooltip .ft-hint { opacity: 0.55; margin-left: 6px; font-weight: normal; }

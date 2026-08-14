@@ -1,5 +1,7 @@
 # Build artifacts
 obsidian-plugin/node_modules/
+browser-extension/node_modules/
+browser-extension/dist/
 
 # Runtime log (contains the user's typed text + LLM request/response payloads)
 llm-log.txt

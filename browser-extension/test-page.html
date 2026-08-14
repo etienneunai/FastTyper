@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>FastTyper smoke test</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 720px; margin: 24px auto; padding: 0 16px; }
+    textarea, input, [contenteditable] { width: 100%; box-sizing: border-box; font: 14px/1.5 inherit; }
+    [contenteditable] { min-height: 72px; border: 1px solid #ccc; border-radius: 6px; padding: 8px; margin-top: 4px; }
+    label { display: block; margin-top: 14px; font-weight: 600; }
+    .note { color: #666; font-size: 12px; margin: 4px 0; font-weight: normal; }
+  </style>
+</head>
+<body>
+  <h1>FastTyper smoke test</h1>
+  <p>Make sure the FastTyper extension is loaded, the daemon is running
+  (<code>systemctl --user status fasttyper</code>), then type a sentence ending
+  in a period or press Enter in each field below.</p>
+
+  <label>Plain textarea <span class="note">→ pill with Undo button</span></label>
+  <textarea id="ta" rows="3" placeholder="e.g. I hav a apple."></textarea>
+
+  <label>Contenteditable <span class="note">→ wavy underline + hover to revert</span></label>
+  <div id="ce" contenteditable="true">I hav a apple.</div>
+
+  <label>Single-line input</label>
+  <input id="in" type="text" placeholder="e.g. I am goin home.">
+
+  <label>Password field (must be skipped)</label>
+  <input id="pw" type="password" placeholder="typing here should NOT be corrected">
+
+  <p class="note">Expected: "I hav a apple." → "I have a apple." (spelling fixes only;
+  the model won't fix "a apple"). Press <strong>Ctrl+Z</strong> / the pill Undo button to
+  revert. Typing in the password field must do nothing.</p>
+</body>
+</html>

@@ -78,11 +78,45 @@ Once enabled you get:
 ## Project layout
 
 ```
-backend/           Llama.cpp daemon: systemd unit + setup.fish (model download, Vulkan build)
-obsidian-plugin/   CodeMirror 6 Obsidian plugin (src/main.ts is the core)
-fcitx5-proxy/      Unimplemented scaffolding for a system-wide Wayland fallback (not used)
-CLAUDE.md          Detailed development notes and architecture
+backend/              Llama.cpp daemon: systemd unit + setup.fish (model download, Vulkan build)
+obsidian-plugin/      CodeMirror 6 Obsidian plugin (src/main.ts is the core)
+browser-extension/    Firefox extension: local grammar correction in web text fields
+CLAUDE.md             Detailed development notes and architecture
 ```
+
+### Browser extension (universal correction for the web)
+
+Corrects typos in any web text field by reusing the same engine as the Obsidian
+plugin (same sentence trigger, same minimal LCS diff, same model call). It talks
+to the same `127.0.0.1:8808` daemon, so **no backend changes are needed**.
+
+- **Where it works**: plain `<textarea>`s, `input[type=text]`, and
+  contenteditable editors (e.g. GitHub comments, email composers, CMS editors).
+- **Where it's disabled**: password/login/username fields, Google Docs
+  (canvas-rendered), and mirrored-hidden-textarea editors (CodeMirror, Monaco,
+  Notion-style) — their visible text isn't DOM text.
+- **Revert**: in contenteditable editors, corrections get a wavy underline and a
+  hover → click-to-revert tooltip (and Ctrl+Z works, since edits go through
+  `execCommand`). Plain textareas can't show inline markup, so those show a
+  transient pill near the field with an Undo button.
+- **Controls**: toolbar popup (pause, capitalize-sentence-initials, accept-all,
+  daemon status, recent-exchange log) plus a `Ctrl+Shift+F` pause shortcut.
+- **Logging**: browser extensions have no filesystem access, so the exchange log
+  lives in `storage.local` (last 50) and is viewable in the popup, rather than
+  `llm-log.txt`.
+
+**Build & load (development):**
+
+```bash
+cd browser-extension
+npm install          # first time only
+npm run build        # esbuild → dist/ + tsc --noEmit must pass
+```
+
+Load in Firefox via `about:debugging#/runtime/this-firefox` → **Load Temporary
+Add-on** → select `browser-extension/dist/manifest.json`. Reload after each
+build. (For a permanent install, sign it on addons.mozilla.org or use
+`about:config` → `xpinstall.signatures.required=false` for a local build.)
 
 ## Privacy
 

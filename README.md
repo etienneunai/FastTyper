@@ -6,11 +6,11 @@ Fully-local, low-latency grammar correction. A `llama.cpp` daemon runs a purpose
 
 1. **Trigger** — The plugin fires the moment you insert a stopping punctuation (`.`, `?`, `!`) or a newline, then waits **100 ms** to confirm the character wasn't deleted.
 2. **Capture** — For punctuation, the completed sentence (with `.?!`-cluster, abbreviation, and decimal heuristics); for a newline, the completed line. Units over 800 chars or containing code/frontmatter are skipped.
-3. **Correct** — The unit is POSTed to `http://127.0.0.1:8808/v1/chat/completions`. The model returns the **full corrected text** (`temperature: 0`), and the plugin computes a character-level LCS diff so only the minimal changed spans are applied in place.
+3. **Correct** — The unit is POSTed to the daemon (default `http://127.0.0.1:8808`; configurable in Settings → FastTyper → LLM Base URL). The model returns the **full corrected text** (`temperature: 0`), and the plugin computes a character-level LCS diff so only the minimal changed spans are applied in place.
 4. **Revert** — Each correction gets a wavy underline. Hovering shows the original typo with surrounding context; click to revert.
 5. **Resend-on-conflict** — If you keep typing while a request is in flight, the plugin detects the span changed and **re-sends the current text** (up to 3 retries) instead of inserting stale text. Only one request is in flight at a time; later triggers queue.
 6. **Capitalization** — Sentence-initial letters are capitalized deterministically in the plugin (the model is spelling-only and won't do it). Toggleable in settings.
-7. **Log** — Every exchange is appended to `llm-log.txt` (gitignored) for debugging.
+7. **Log** — File logging is disabled in the published plugin. For local debugging, restore `logExchange()` in `src/main.ts` using `app.vault.adapter.append()`.
 
 ## Models
 
@@ -24,12 +24,12 @@ Fully-local, low-latency grammar correction. A `llama.cpp` daemon runs a purpose
 
 ### Download the models
 
-```fish
+```bash
 cd backend
-fish setup.fish
+bash setup.sh
 ```
 
-`setup.fish` downloads the primary model to `~/.local/share/models/` and builds `llama.cpp` with Vulkan support, installing `llama-server` (binary **and** shared libs) into `/usr/local`.
+`setup.sh` downloads the primary model to `~/.local/share/models/` and builds `llama.cpp` with Vulkan support, installing `llama-server` (binary **and** shared libs) into `/usr/local`.
 
 Or download manually:
 
@@ -70,15 +70,25 @@ cp -r {main.js,manifest.json,styles.css} ~/path/to/YourVault/.obsidian/plugins/f
 Then reload Obsidian (Ctrl-R) and enable the plugin under **Settings → Community plugins**.
 
 Once enabled you get:
-- **Two hotkey-bindable commands** (Settings → Hotkeys, search "FastTyper"):
+- **Four hotkey-bindable commands** (Settings → Hotkeys, search "FastTyper"):
   - *FastTyper: Accept all corrections* — commit every applied correction and clear the underlines.
   - *FastTyper: Pause/resume corrections* — stop/start triggering new corrections (with a notification).
-- **A settings tab** (Settings → FastTyper) with the pause toggle, a *Capitalize sentence-initial letters* toggle, and an *Accept all* button.
+  - *FastTyper: Cycle thinking mode* — rotate Fast → Auto → Always.
+  - *FastTyper: Halt current correction* — discard the in-flight request (nothing is applied) and drop queued/pending work; the next sentence still corrects normally. Bind it to Esc if you want to stop a slow thinking pass.
+- **A settings tab** (Settings → FastTyper) with:
+  - Daemon status indicator (🟢 / 🔴) with live connectivity check.
+  - *LLM Base URL* — change the daemon address (default `http://127.0.0.1:8808`).
+  - *Model Name* — the exact model filename/identifier the daemon has loaded.
+  - *Pause corrections* toggle.
+  - *Capitalize sentence-initial letters* toggle.
+  - *Correction prompt* dropdown (A / B / E / C / Custom).
+  - *Thinking mode* dropdown (Fast / Auto / Always).
+  - *Accept all* button.
 
 ## Project layout
 
 ```
-backend/              Llama.cpp daemon: systemd unit + setup.fish (model download, Vulkan build)
+backend/              Llama.cpp daemon: systemd unit + setup.sh (model download, Vulkan build)
 obsidian-plugin/      CodeMirror 6 Obsidian plugin (src/main.ts is the core)
 browser-extension/    Firefox extension: local grammar correction in web text fields
 CLAUDE.md             Detailed development notes and architecture
@@ -88,7 +98,8 @@ CLAUDE.md             Detailed development notes and architecture
 
 Corrects typos in any web text field by reusing the same engine as the Obsidian
 plugin (same sentence trigger, same minimal LCS diff, same model call). It talks
-to the same `127.0.0.1:8808` daemon, so **no backend changes are needed**.
+to the same local daemon — the URL and model name are configurable in the popup
+(default `http://127.0.0.1:8808`), so **no backend changes are needed**.
 
 - **Where it works**: plain `<textarea>`s, `input[type=text]`, and
   contenteditable editors (e.g. GitHub comments, email composers, CMS editors).
@@ -102,9 +113,12 @@ to the same `127.0.0.1:8808` daemon, so **no backend changes are needed**.
   shows a transient pill with the corrected sentence, every changed word shown
   as `was → now`, and one Undo button that reverts all of them.
 - **Controls**: toolbar popup (pause, capitalize-sentence-initials, accept-all,
-  site blacklist, daemon status, recent-exchange log) plus a `Ctrl+Shift+F`
-  pause shortcut. If you edit a corrected sentence again, it isn't re-corrected
-  over your typing.
+  halt-current-correction, site blacklist, daemon status, recent-exchange log)
+  plus a `Ctrl+Shift+F` pause shortcut and a `Ctrl+Shift+E` halt shortcut
+  (rebindable under Manage Extension Shortcuts; halt also aborts the daemon's
+  in-flight request, so a long thinking pass stops rather than just being
+  ignored). If you edit a corrected sentence again, it isn't re-corrected over
+  your typing.
 - **Logging**: browser extensions have no filesystem access, so the exchange log
   lives in `storage.local` (last 50) and is viewable in the popup, rather than
   `llm-log.txt`.

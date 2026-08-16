@@ -29,6 +29,11 @@
     <textarea id="customUser" rows="3" placeholder="Fix any spelling mistakes in this text. If there are no mistakes, output the text unchanged."></textarea>
   </div>
   <button id="acceptAll" class="btn">Accept all corrections</button>
+  <button id="halt" class="btn">Halt current correction</button>
+  <label for="llmBase" class="bl-label">LLM Base URL</label>
+  <input type="text" id="llmBase" class="txt" placeholder="http://127.0.0.1:8808">
+  <label for="model" class="bl-label">Model name</label>
+  <input type="text" id="model" class="txt" placeholder="dyslexic-writer-qwen3-4b-q4_k_m.gguf">
   <div id="status" class="status">Daemon: checking…</div>
   <label for="blacklist" class="bl-label">Skip corrections on these sites (one per line)</label>
   <textarea id="blacklist" rows="3" placeholder="example.com&#10;docs.google.com"></textarea>

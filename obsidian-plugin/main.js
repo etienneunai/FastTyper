@@ -133,8 +133,6 @@ var grammarCorrectionsField = import_state.StateField.define({
         decorations = decorations.update({ add: newDecos });
       } else if (effect.is(revertCorrection)) {
         decorations = decorations.update({
-          filterFrom: effect.value.from,
-          filterTo: Math.max(effect.value.from, effect.value.to),
           filter: (from, to, value) => correctionOf(value) !== effect.value
         });
       } else if (effect.is(clearCorrections)) {
@@ -161,12 +159,16 @@ var processingField = import_state.StateField.define({
         state = null;
     }
     for (const e of tr.effects) {
-      if (e.is(setProcessing))
-        state = e.value;
+      if (e.is(setProcessing)) {
+        if (e.value && e.value.from < e.value.to)
+          state = e.value;
+        else
+          state = null;
+      }
     }
     return state;
   },
-  provide: (f) => import_view.EditorView.decorations.from(f, (s) => s ? import_view.Decoration.set([import_view.Decoration.mark({
+  provide: (f) => import_view.EditorView.decorations.from(f, (s) => s && s.from < s.to ? import_view.Decoration.set([import_view.Decoration.mark({
     class: s.thinking ? "ft-processing ft-processing-thinking" : "ft-processing"
   }).range(s.from, s.to)]) : import_view.Decoration.none)
 });
@@ -327,6 +329,8 @@ function wordSet() {
 var SUSPECT_REGEX = /[a-z]+(?:'[a-z]+)*/gi;
 function hasSuspectTokens(text) {
   var _a, _b;
+  if (_wordSet === null)
+    return false;
   SUSPECT_REGEX.lastIndex = 0;
   let m;
   while ((m = SUSPECT_REGEX.exec(text)) !== null) {
@@ -359,6 +363,12 @@ var grammarCheckerPlugin = import_view.ViewPlugin.fromClass(class {
     this.queue = [];
     this.destroyed = false;
     this.paused = false;
+    /**
+     * Bumped on every halt. `fire()` records its value at start and checks it
+     * after each await: a halted fire's result is discarded and its `finally`
+     * won't clobber the shared state if a newer fire has started meanwhile.
+     */
+    this.fireSeq = 0;
     this.view = view;
     this.paused = correctionsPaused;
   }
@@ -376,6 +386,33 @@ var grammarCheckerPlugin = import_view.ViewPlugin.fromClass(class {
       if (this.abortController)
         this.abortController.abort();
     }
+  }
+  /**
+   * Halt the current correction: discard the in-flight request (its result is
+   * never applied), drop queued + pending-trigger work, and clear the amber
+   * processing underline. Unlike pause, this doesn't block future triggers —
+   * the next sentence is corrected normally. Returns true if there was work to
+   * halt. (Obsidian's `requestUrl` carries no abort signal, so the daemon may
+   * finish the request, but the response is discarded.)
+   */
+  halt() {
+    const hadWork = this.isPending || this.verifyTimeout !== null || this.queue.length > 0;
+    this.fireSeq++;
+    if (this.verifyTimeout) {
+      clearTimeout(this.verifyTimeout);
+      this.verifyTimeout = null;
+    }
+    this.verifyPos = null;
+    this.verifyChar = "";
+    this.queue = [];
+    if (this.abortController)
+      this.abortController.abort();
+    this.abortController = null;
+    this.isPending = false;
+    this.pending = null;
+    if (!this.destroyed)
+      this.view.dispatch({ effects: setProcessing.of(null) });
+    return hadWork;
   }
   destroy() {
     this.destroyed = true;
@@ -453,6 +490,8 @@ var grammarCheckerPlugin = import_view.ViewPlugin.fromClass(class {
         return;
     }
     if (ch === "\n") {
+      if (pos <= 0)
+        return;
       const line = doc.lineAt(pos - 1);
       const lastNonWs = line.text.trimEnd();
       if (lastNonWs.length > 0) {
@@ -585,6 +624,7 @@ var grammarCheckerPlugin = import_view.ViewPlugin.fromClass(class {
   /** Correct `span`, re-sending (≤MAX_RETRIES) if the text changes while we wait. */
   async fire(span) {
     this.isPending = true;
+    const mySeq = this.fireSeq;
     this.pending = { from: span.from, to: span.to, text: "", lead: 0 };
     let thinking = thinkingMode === "always";
     this.markProcessing(thinking);
@@ -610,7 +650,7 @@ var grammarCheckerPlugin = import_view.ViewPlugin.fromClass(class {
           }
           return;
         }
-        if (this.destroyed || this.paused || this.abortController !== controller)
+        if (this.destroyed || this.paused || this.fireSeq !== mySeq || this.abortController !== controller)
           return;
         this.abortController = null;
         if (!corrected)
@@ -641,12 +681,14 @@ var grammarCheckerPlugin = import_view.ViewPlugin.fromClass(class {
         return;
       }
     } finally {
-      if (!this.destroyed)
-        this.view.dispatch({ effects: setProcessing.of(null) });
-      this.isPending = false;
-      this.abortController = null;
-      this.pending = null;
-      this.maybeFire();
+      if (this.fireSeq === mySeq) {
+        if (!this.destroyed)
+          this.view.dispatch({ effects: setProcessing.of(null) });
+        this.isPending = false;
+        this.abortController = null;
+        this.pending = null;
+        this.maybeFire();
+      }
     }
   }
   /**
@@ -712,7 +754,8 @@ var grammarCheckerPlugin = import_view.ViewPlugin.fromClass(class {
       url: LLM_URL,
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload)
+      body: JSON.stringify(payload),
+      throw: false
     });
     if (response.status !== 200) {
       console.error("FastTyper: daemon returned", response.status);
@@ -797,6 +840,7 @@ var FastTyperSettingTab = class extends import_obsidian.PluginSettingTab {
       new import_obsidian.Setting(containerEl).setName("Custom user prompt").setDesc("The user-message template. {text} is replaced with the sentence/line to correct.").addTextArea((text) => text.setPlaceholder(PROMPT_PRESETS[0].user).setValue(customUser).onChange((value) => this.plugin.setCustomUser(value)));
     }
     new import_obsidian.Setting(containerEl).setName("Accept all corrections").setDesc("Commit every currently-applied correction and clear its underline.").addButton((button) => button.setButtonText("Accept all").setCta().onClick(() => this.plugin.acceptAll()));
+    new import_obsidian.Setting(containerEl).setName("Halt current correction").setDesc("Discard the in-flight correction request \u2014 nothing is applied. Queued and pending-trigger units are dropped too. (Also a hotkey-bindable command: Settings \u2192 Hotkeys \u2192 'FastTyper: Halt current correction'.)").addButton((button) => button.setButtonText("Halt").onClick(() => this.plugin.haltCurrent()));
   }
 };
 var FastTyperPlugin = class extends import_obsidian.Plugin {
@@ -846,6 +890,11 @@ var FastTyperPlugin = class extends import_obsidian.Plugin {
         this.setThinkingMode(next);
       }
     });
+    this.addCommand({
+      id: "halt-corrections",
+      name: "Halt current correction",
+      callback: () => this.haltCurrent()
+    });
     this.settingsTab = new FastTyperSettingTab(this.app, this);
     this.addSettingTab(this.settingsTab);
     this.registerEditorExtension([
@@ -865,6 +914,16 @@ var FastTyperPlugin = class extends import_obsidian.Plugin {
     if (!cv)
       return;
     cv.dispatch({ effects: clearCorrections.of(null) });
+  }
+  /** Discard the active editor's in-flight/queued corrections (nothing is applied). */
+  haltCurrent() {
+    var _a, _b;
+    const cv = this.activeCm();
+    if (!cv)
+      return;
+    const halted = (_b = (_a = cv.plugin(grammarCheckerPlugin)) == null ? void 0 : _a.halt()) != null ? _b : false;
+    if (halted)
+      new import_obsidian.Notice("FastTyper: correction halted");
   }
   /** Toggle corrections on/off across all open editors and persist the choice. */
   async setPaused(paused) {

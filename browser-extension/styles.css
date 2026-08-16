@@ -23,7 +23,8 @@ h1 { font-size: 15px; margin: 0 0 10px; }
 .status.ok { color: #16a34a; }
 .status.bad { color: #dc2626; }
 .bl-label { display: block; margin-top: 10px; font-size: 12px; color: #555; }
-select.sel {
+select.sel,
+input.txt {
   width: 100%;
   box-sizing: border-box;
   margin-top: 4px;

@@ -399,6 +399,7 @@ function hasSuspectTokens(text: string): boolean {
     while ((m = SUSPECT_REGEX.exec(text)) !== null) {
         const raw = m[0];
         if (/\d/.test(text[m.index - 1] ?? "") || /\d/.test(text[m.index + raw.length] ?? "")) continue;
+        if (/[A-Z]/.test(raw)) continue;        // proper nouns + the capitalized sentence start
         const token = raw.toLowerCase();
         if (token.includes("'")) continue;      // don't, it's, James'
         if (token.length === 1) { if (token === "i") return true; continue; }
@@ -422,6 +423,12 @@ const grammarCheckerPlugin = ViewPlugin.fromClass(class {
     queue: { from: number; to: number }[] = [];
     destroyed: boolean = false;
     paused: boolean = false;
+    /**
+     * Bumped on every halt. `fire()` records its value at start and checks it
+     * after each await: a halted fire's result is discarded and its `finally`
+     * won't clobber the shared state if a newer fire has started meanwhile.
+     */
+    fireSeq: number = 0;
 
     constructor(view: EditorView) {
         this.view = view;
@@ -438,6 +445,29 @@ const grammarCheckerPlugin = ViewPlugin.fromClass(class {
             this.queue = [];
             if (this.abortController) this.abortController.abort();
         }
+    }
+
+    /**
+     * Halt the current correction: discard the in-flight request (its result is
+     * never applied), drop queued + pending-trigger work, and clear the amber
+     * processing underline. Unlike pause, this doesn't block future triggers —
+     * the next sentence is corrected normally. Returns true if there was work to
+     * halt. (Obsidian's `requestUrl` carries no abort signal, so the daemon may
+     * finish the request, but the response is discarded.)
+     */
+    halt(): boolean {
+        const hadWork = this.isPending || this.verifyTimeout !== null || this.queue.length > 0;
+        this.fireSeq++; // invalidate any in-flight fire so its result is discarded
+        if (this.verifyTimeout) { clearTimeout(this.verifyTimeout); this.verifyTimeout = null; }
+        this.verifyPos = null;
+        this.verifyChar = "";
+        this.queue = [];
+        if (this.abortController) this.abortController.abort();
+        this.abortController = null;
+        this.isPending = false;
+        this.pending = null;
+        if (!this.destroyed) this.view.dispatch({ effects: setProcessing.of(null) });
+        return hadWork;
     }
 
     destroy() {
@@ -676,6 +706,7 @@ const grammarCheckerPlugin = ViewPlugin.fromClass(class {
     /** Correct `span`, re-sending (≤MAX_RETRIES) if the text changes while we wait. */
     private async fire(span: { from: number; to: number }) {
         this.isPending = true;
+        const mySeq = this.fireSeq;
         this.pending = { from: span.from, to: span.to, text: "", lead: 0 };
         // "auto" starts flat and escalates once (below) if flat changes nothing.
         let thinking = thinkingMode === "always";
@@ -702,7 +733,7 @@ const grammarCheckerPlugin = ViewPlugin.fromClass(class {
                     }
                     return;
                 }
-                if (this.destroyed || this.paused || this.abortController !== controller) return;
+                if (this.destroyed || this.paused || this.fireSeq !== mySeq || this.abortController !== controller) return;
                 this.abortController = null;
 
                 if (!corrected) return; // nothing usable from the model
@@ -741,11 +772,16 @@ const grammarCheckerPlugin = ViewPlugin.fromClass(class {
                 return;
             }
         } finally {
-            if (!this.destroyed) this.view.dispatch({ effects: setProcessing.of(null) });
-            this.isPending = false;
-            this.abortController = null;
-            this.pending = null;
-            this.maybeFire();
+            // Only the current fire resets the shared state — a halted fire that
+            // resolves after a newer one started must not clobber it (halt()
+            // already reset everything it needs to).
+            if (this.fireSeq === mySeq) {
+                if (!this.destroyed) this.view.dispatch({ effects: setProcessing.of(null) });
+                this.isPending = false;
+                this.abortController = null;
+                this.pending = null;
+                this.maybeFire();
+            }
         }
     }
 
@@ -975,6 +1011,13 @@ class FastTyperSettingTab extends PluginSettingTab {
                 .setButtonText("Accept all")
                 .setCta()
                 .onClick(() => this.plugin.acceptAll()));
+
+        new Setting(containerEl)
+            .setName("Halt current correction")
+            .setDesc("Discard the in-flight correction request — nothing is applied. Queued and pending-trigger units are dropped too. (Also a hotkey-bindable command: Settings → Hotkeys → 'FastTyper: Halt current correction'.)")
+            .addButton(button => button
+                .setButtonText("Halt")
+                .onClick(() => this.plugin.haltCurrent()));
     }
 }
 
@@ -1017,6 +1060,11 @@ export default class FastTyperPlugin extends Plugin {
                 this.setThinkingMode(next);
             }
         });
+        this.addCommand({
+            id: "halt-corrections",
+            name: "Halt current correction",
+            callback: () => this.haltCurrent()
+        });
 
         this.settingsTab = new FastTyperSettingTab(this.app, this);
         this.addSettingTab(this.settingsTab);
@@ -1042,6 +1090,14 @@ export default class FastTyperPlugin extends Plugin {
         const cv = this.activeCm();
         if (!cv) return;
         cv.dispatch({ effects: clearCorrections.of(null) });
+    }
+
+    /** Discard the active editor's in-flight/queued corrections (nothing is applied). */
+    haltCurrent() {
+        const cv = this.activeCm();
+        if (!cv) return;
+        const halted = cv.plugin(grammarCheckerPlugin)?.halt() ?? false;
+        if (halted) new Notice("FastTyper: correction halted");
     }
 
     /** Toggle corrections on/off across all open editors and persist the choice. */

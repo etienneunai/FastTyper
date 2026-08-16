@@ -19,6 +19,8 @@ async function refresh(): Promise<void> {
   ($("customUser") as HTMLTextAreaElement).value = st.customUser;
   toggleCustom(st.promptId);
   ($("blacklist") as HTMLTextAreaElement).value = (st.blacklist ?? []).join("\n");
+  ($("llmBase") as HTMLInputElement).value = st.llmBase ?? "";
+  ($("model") as HTMLInputElement).value = st.model ?? "";
   const status = $("status");
   status.textContent =
     st.daemonUp === true
@@ -53,10 +55,19 @@ async function refresh(): Promise<void> {
 $("acceptAll").addEventListener("click", () => {
   void browser.runtime.sendMessage({ type: "acceptAll" });
 });
+$("halt").addEventListener("click", () => {
+  void browser.runtime.sendMessage({ type: "halt" });
+});
 $("saveBlacklist").addEventListener("click", () => {
   const raw = ($("blacklist") as HTMLTextAreaElement).value;
   const list = raw.split("\n").map((s) => s.trim()).filter(Boolean);
   void browser.runtime.sendMessage({ type: "setBlacklist", blacklist: list });
+});
+($("llmBase") as HTMLInputElement).addEventListener("change", (e) => {
+  void browser.runtime.sendMessage({ type: "setLlmBase", value: (e.target as HTMLInputElement).value.trim() });
+});
+($("model") as HTMLInputElement).addEventListener("change", (e) => {
+  void browser.runtime.sendMessage({ type: "setModel", value: (e.target as HTMLInputElement).value.trim() });
 });
 $("logWrap").addEventListener("toggle", () => {
   void browser.runtime.sendMessage({ type: "getLog" }).then((r) => {

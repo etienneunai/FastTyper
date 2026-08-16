@@ -6,5 +6,9 @@ browser-extension/dist/
 # Runtime log (contains the user's typed text + LLM request/response payloads)
 llm-log.txt
 
-# LLM model weights — never committed; downloaded by backend/setup.fish to ~/.local/share/models/
+# Debug / instrumentation logs
+trigger-debug.log
+*-debug.log
+
+# LLM model weights — never committed; downloaded by backend/setup.sh to ~/.local/share/models/
 *.gguf

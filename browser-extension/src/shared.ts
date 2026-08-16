@@ -235,6 +235,7 @@ export function buildPayload(model: string, text: string, prompt: ActivePrompt, 
 export type Request =
   | { type: "correct"; text: string; thinking: boolean }
   | { type: "acceptAll" }
+  | { type: "halt" }
   | { type: "checkSuspects"; text: string }
   | { type: "getState" }
   | { type: "setPaused"; paused: boolean }
@@ -244,6 +245,8 @@ export type Request =
   | { type: "setCustomUser"; value: string }
   | { type: "setBlacklist"; blacklist: string[] }
   | { type: "setThinkingMode"; thinkingMode: ThinkingMode }
+  | { type: "setLlmBase"; value: string }
+  | { type: "setModel"; value: string }
   | { type: "getLog" };
 
 export type Response =
@@ -262,4 +265,5 @@ export interface LogEntry {
 /** Push-to-content-script settings/command messages (not request/response). */
 export type PushMsg =
   | { type: "settings"; paused: boolean; capitalize: boolean; blacklist: string[]; thinkingMode: ThinkingMode }
-  | { type: "acceptAll" };
+  | { type: "acceptAll" }
+  | { type: "halt" };

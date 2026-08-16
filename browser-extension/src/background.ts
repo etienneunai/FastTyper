@@ -75,12 +75,16 @@ async function getLog(): Promise<LogEntry[]> {
   return (got[LOG_KEY] as LogEntry[] | undefined) ?? [];
 }
 
+/** The tab id → AbortController for every daemon request in flight (for the halt command). */
+const inFlight = new Map<number, AbortController>();
+
 /** POST a sentence to the daemon → the corrected text (or null). */
-async function correct(text: string, thinking: boolean, url?: string): Promise<string | null> {
+async function correct(text: string, thinking: boolean, url?: string, tabId?: number): Promise<string | null> {
   const s = await getSettings();
   const promptId = thinking ? "E" : s.promptId;
   const body = JSON.stringify(buildPayload(s.model, text, resolvePrompt(promptId, s.customSystem, s.customUser), thinking));
   const controller = new AbortController();
+  if (typeof tabId === "number") inFlight.set(tabId, controller);
   const timer = setTimeout(() => controller.abort(), 30_000);
   try {
     const resp = await fetch(`${s.llmBase}/v1/chat/completions`, {
@@ -110,7 +114,18 @@ async function correct(text: string, thinking: boolean, url?: string): Promise<s
     return null;
   } finally {
     clearTimeout(timer);
+    if (typeof tabId === "number") inFlight.delete(tabId);
   }
+}
+
+/**
+ * Halt the correction in a tab: abort the daemon fetch for that tab (so the
+ * model actually stops thinking) and tell its content script to drop queued +
+ * in-flight work.
+ */
+async function haltProcessing(tabId?: number): Promise<void> {
+  if (typeof tabId === "number") inFlight.get(tabId)?.abort();
+  await broadcast({ type: "halt" });
 }
 
 let _wordSet: Set<string> | null = null;
@@ -128,6 +143,11 @@ async function wordSet(): Promise<Set<string>> {
   return _wordSet;
 }
 
+// Mirrors obsidian-plugin/src/main.ts hasSuspectTokens() exactly: never flags
+// digit-bordered tokens ("v2"), any-uppercase tokens (proper nouns + the
+// capitalized sentence start), or apostrophe tokens (contractions). Lone
+// lowercase "i" is a real typo for "I" and *is* a dictionary word, so it's
+// flagged explicitly.
 const SUSPECT_REGEX = /[a-z]+(?:'[a-z]+)*/gi;
 async function hasSuspectTokens(text: string): Promise<boolean> {
   const ws = await wordSet();
@@ -135,10 +155,11 @@ async function hasSuspectTokens(text: string): Promise<boolean> {
   let m: RegExpExecArray | null;
   while ((m = SUSPECT_REGEX.exec(text)) !== null) {
     const raw = m[0];
+    if (/\d/.test(text[m.index - 1] ?? "") || /\d/.test(text[m.index + raw.length] ?? "")) continue;
+    if (/[A-Z]/.test(raw)) continue;
     const token = raw.toLowerCase();
-    if (token.includes("'")) continue; // Naive: skip words with apostrophes
-    if (token.length === 1 && token !== "i") continue;
-    
+    if (token.includes("'")) continue;      // don't, it's, James'
+    if (token.length === 1) { if (token === "i") return true; continue; }
     if (!ws.has(token)) return true;
   }
   return false;
@@ -163,8 +184,13 @@ browser.runtime.onMessage.addListener(
   (msg: Request, sender): Promise<Response> => {
     switch (msg.type) {
       case "correct":
-        return correct(msg.text, msg.thinking, sender.tab?.url).then(
+        return correct(msg.text, msg.thinking, sender.tab?.url, sender.tab?.id).then(
           (corrected): Response => ({ type: "correctResult", corrected })
+        );
+
+      case "halt":
+        return haltProcessing(sender.tab?.id).then(
+          (): Response => ({ type: "correctResult", corrected: null })
         );
 
       case "checkSuspects":
@@ -226,6 +252,20 @@ browser.runtime.onMessage.addListener(
           )
         );
 
+      case "setLlmBase":
+        return getSettings().then((s) =>
+          saveSettings({ ...s, llmBase: msg.value }).then(
+            (): Response => ({ type: "correctResult", corrected: null })
+          )
+        );
+
+      case "setModel":
+        return getSettings().then((s) =>
+          saveSettings({ ...s, model: msg.value }).then(
+            (): Response => ({ type: "correctResult", corrected: null })
+          )
+        );
+
       case "getState":
         return Promise.all([getSettings(), daemonUp()]).then(
           ([s, up]): Response => ({ type: "state", paused: s.paused, capitalize: s.capitalize, blacklist: s.blacklist, promptId: s.promptId, customSystem: s.customSystem, customUser: s.customUser, thinkingMode: s.thinkingMode, llmBase: s.llmBase, model: s.model, daemonUp: up })
@@ -245,5 +285,7 @@ browser.runtime.onMessage.addListener(
 browser.commands.onCommand.addListener((command) => {
   if (command === "toggle-corrections") {
     getSettings().then((s) => saveSettings({ ...s, paused: !s.paused }));
+  } else if (command === "halt-corrections") {
+    browser.tabs.query({ active: true, currentWindow: true }).then((tabs) => haltProcessing(tabs[0]?.id));
   }
 });

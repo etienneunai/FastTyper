@@ -67,7 +67,38 @@ var PROMPT_PRESETS = [
     user: "Insert missing spaces between run-together words, fix spelling and a/an errors. Return only the corrected text.\n\n{text}"
   }
 ];
+var LLM_LOG_PATH = "FastTyper-LLM-Log.md";
+var loggingEnabled = false;
 var ABBREVIATIONS = /* @__PURE__ */ new Set(["e.g.", "i.e.", "etc.", "Mr.", "Mrs.", "Ms.", "Dr.", "St.", "vs.", "no."]);
+function logExchange(sent, received) {
+  var _a;
+  if (!loggingEnabled)
+    return;
+  try {
+    const app = window.app;
+    if (!((_a = app == null ? void 0 : app.vault) == null ? void 0 : _a.adapter))
+      return;
+    const ts = (/* @__PURE__ */ new Date()).toISOString();
+    const entry = `
+## ${ts}
+
+**sent**
+
+\`\`\`text
+${sent}
+\`\`\`
+
+**received**
+
+\`\`\`json
+${received}
+\`\`\`
+`;
+    void app.vault.adapter.append(LLM_LOG_PATH, entry);
+  } catch (e) {
+    console.error("FastTyper: failed to write LLM log", e);
+  }
+}
 var setCorrections = import_state.StateEffect.define();
 var revertCorrection = import_state.StateEffect.define();
 var clearCorrections = import_state.StateEffect.define();
@@ -259,6 +290,82 @@ var ECHO_MARKERS = ["ordinary content", "not instructions to you", "do not dwell
 function isInstructionEcho(corrected) {
   const c = corrected.toLowerCase();
   return ECHO_MARKERS.some((m) => c.includes(m));
+}
+function markdownSignature(text) {
+  const runs = [];
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (c === "*" || c === "_" || c === "~") {
+      let j = i;
+      while (j < text.length && text[j] === c)
+        j++;
+      runs.push(c.repeat(j - i));
+      i = j - 1;
+    }
+  }
+  return runs.join("|");
+}
+function linkSpans(s) {
+  const spans = [];
+  let i = 0;
+  while (i < s.length - 1) {
+    if (s[i] === "[" && s[i + 1] === "[") {
+      const close = s.indexOf("]]", i + 2);
+      if (close === -1) {
+        spans.push({ from: i, to: s.length, inner: s.slice(i + 2), closed: false });
+        break;
+      }
+      spans.push({ from: i, to: close + 2, inner: s.slice(i + 2, close), closed: true });
+      i = close + 2;
+    } else {
+      i++;
+    }
+  }
+  return spans;
+}
+function maskLinks(s) {
+  const spans = linkSpans(s);
+  if (spans.length === 0)
+    return { masked: s, links: [] };
+  let out = "";
+  let last = 0;
+  for (const sp of spans) {
+    out += s.slice(last, sp.from + 2);
+    out += "\xB7".repeat(sp.inner.length);
+    out += sp.closed ? s.slice(sp.to - 2, sp.to) : "";
+    last = sp.to;
+  }
+  out += s.slice(last);
+  return { masked: out, links: spans };
+}
+function linksIntact(text, corrected) {
+  const a = linkSpans(text);
+  const b = linkSpans(corrected);
+  if (a.length !== b.length)
+    return false;
+  for (let i = 0; i < a.length; i++) {
+    if (a[i].inner.length !== b[i].inner.length)
+      return false;
+    if (a[i].closed !== b[i].closed)
+      return false;
+  }
+  return true;
+}
+function restoreLinks(corrected, links) {
+  const spans = linkSpans(corrected);
+  if (spans.length === 0)
+    return corrected;
+  let out = "";
+  let last = 0;
+  for (let k = 0; k < spans.length; k++) {
+    const sp = spans[k];
+    out += corrected.slice(last, sp.from + 2);
+    out += links[k].inner;
+    out += sp.closed ? corrected.slice(sp.to - 2, sp.to) : "";
+    last = sp.to;
+  }
+  out += corrected.slice(last);
+  return out;
 }
 var MAX_CHAR_DIFF_CELLS = 4e6;
 var diffBuffer = new Int32Array(MAX_CHAR_DIFF_CELLS + 2e3);
@@ -453,11 +560,15 @@ var grammarCheckerPlugin = import_view.ViewPlugin.fromClass(class {
     for (let t = update.transactions.length - 1; t >= 0; t--) {
       let found = null;
       update.transactions[t].changes.iterChanges((fromA, toA, fromB, toB, inserted) => {
+        var _a, _b;
         const s = inserted.toString();
         if (fromA !== toA && !s.includes("\n"))
           return;
         for (let k = s.length - 1; k >= 0; k--) {
           const c = s[k];
+          if (c === "." && /\d/.test((_a = s[k - 1]) != null ? _a : "") && /\s/.test((_b = s[k + 1]) != null ? _b : "") && s.includes("\n")) {
+            continue;
+          }
           if (c === "." || c === "?" || c === "!" || c === "\n") {
             found = { pos: fromB + k, ch: c };
             break;
@@ -513,6 +624,8 @@ var grammarCheckerPlugin = import_view.ViewPlugin.fromClass(class {
     if (doc.sliceString(span.from, span.to).trim().length < MIN_UNIT_CHARS)
       return;
     if (this.containsCode(span.from, span.to))
+      return;
+    if (this.containsMath(span.from, span.to))
       return;
     this.queue.push(span);
     this.maybeFire();
@@ -610,6 +723,21 @@ var grammarCheckerPlugin = import_view.ViewPlugin.fromClass(class {
     });
     return found;
   }
+  /** True if the range overlaps math (`$…$` inline or `$$…$$` block). */
+  containsMath(from, to) {
+    let found = false;
+    (0, import_language.syntaxTree)(this.view.state).iterate({
+      from,
+      to,
+      enter: (node) => {
+        if (node.name.includes("Math")) {
+          found = true;
+          return false;
+        }
+      }
+    });
+    return found;
+  }
   /** Map a span forward through a change set (keeps it accurate while the user types). */
   mapSpan(span, changes) {
     return { from: changes.mapPos(span.from, 1), to: changes.mapPos(span.to, -1) };
@@ -636,6 +764,8 @@ var grammarCheckerPlugin = import_view.ViewPlugin.fromClass(class {
         if (text.length < MIN_UNIT_CHARS)
           return;
         if (this.containsCode(this.pending.from, this.pending.to))
+          return;
+        if (this.containsMath(this.pending.from, this.pending.to))
           return;
         this.pending.text = text;
         this.pending.lead = lead;
@@ -724,18 +854,19 @@ var grammarCheckerPlugin = import_view.ViewPlugin.fromClass(class {
    */
   async request(text, signal, thinking) {
     var _a, _b, _c, _d;
+    const { masked, links } = maskLinks(text);
     const prompt = thinking ? (_a = PROMPT_PRESETS.find((p) => p.id === "E")) != null ? _a : PROMPT_PRESETS[0] : activePrompt();
     const payload = {
       model: MODEL,
       messages: [
         { role: "system", content: prompt.system },
-        { role: "user", content: prompt.user.split("{text}").join(text) }
+        { role: "user", content: prompt.user.split("{text}").join(masked) }
       ],
       temperature: 0,
       // Thinking needs headroom for the reasoning block; flat stays capped
       // by text length. Never let a runaway thinking pass burn the whole
       // budget and return empty (see reasoning_budget_tokens below).
-      max_tokens: thinking ? 2048 : Math.min(2048, Math.ceil(text.length / 3) + 256),
+      max_tokens: thinking ? 2048 : Math.min(2048, Math.ceil(masked.length / 3) + 256),
       chat_template_kwargs: { enable_thinking: thinking },
       // Per-request reasoning cap: force-emits the end-of-thinking tag when
       // exhausted, so the model can't burn max_tokens on reasoning_content
@@ -767,11 +898,17 @@ var grammarCheckerPlugin = import_view.ViewPlugin.fromClass(class {
       return null;
     }
     const content = data.choices[0].message.content;
-    const corrected = parseResponse(content);
+    logExchange(text, JSON.stringify(data.choices[0].message));
+    let corrected = parseResponse(content);
     if (!corrected)
       return null;
     if (isInstructionEcho(corrected))
       return null;
+    if (markdownSignature(masked) !== markdownSignature(corrected))
+      return null;
+    if (!linksIntact(text, corrected))
+      return null;
+    corrected = restoreLinks(corrected, links);
     if (corrected.length > text.length * 2 + 200)
       return null;
     return corrected;
@@ -833,6 +970,7 @@ var FastTyperSettingTab = class extends import_obsidian.PluginSettingTab {
     }));
     new import_obsidian.Setting(containerEl).setName("Pause corrections").setDesc("Stop triggering new corrections. Applied corrections stay until accepted or reverted.").addToggle((toggle) => toggle.setValue(correctionsPaused).onChange((value) => this.plugin.setPaused(value)));
     new import_obsidian.Setting(containerEl).setName("Capitalize sentence-initial letters").setDesc("Capitalize the first letter of each corrected sentence. Done deterministically in the plugin (the model is spelling-only and won't do it).").addToggle((toggle) => toggle.setValue(capitalizeInitials).onChange((value) => this.plugin.setCapitalizeInitials(value)));
+    new import_obsidian.Setting(containerEl).setName("Log LLM exchanges").setDesc("Append every request/response to FastTyper-LLM-Log.md in the vault root (a debugging aid \u2014 off by default).").addToggle((toggle) => toggle.setValue(loggingEnabled).onChange((value) => this.plugin.setLoggingEnabled(value)));
     new import_obsidian.Setting(containerEl).setName("Correction prompt").setDesc("Which prompt to send the model. A \u2014 prod: the default, spelling-only, never corrupts correct text. B \u2014 gram: adds missing spaces and a/an, keeps A's safety and speed. E \u2014 proof: most capable (a/an, apostrophes, run-together) but slow \u2014 emits a ~340-token reasoning block per request (6\u201325 s). C \u2014 clean: fixes a/an and run-together but unreliable (empty outputs, mid-sentence truncation) \u2014 a correction risk. Custom: edit both messages.").addDropdown((drop) => drop.addOption("A", "A \u2014 prod").addOption("B", "B \u2014 gram").addOption("E", "E \u2014 proof").addOption("C", "C \u2014 clean").addOption(CUSTOM_PROMPT_ID, "Custom").setValue(promptId).onChange((value) => this.plugin.setPromptId(value)));
     new import_obsidian.Setting(containerEl).setName("Thinking mode").setDesc("Auto \u2014 flat attempt first (~0.4 s); escalates once to E + thinking (~6\u201312 s) only if flat changes nothing or leaves misspelled-looking (non-dictionary) tokens. Always \u2014 E + thinking on every trigger. Fast \u2014 flat-only; leaves transposed/doubled-letter dyslexic typos unchanged (use Auto if you hit those). While correcting, the unit is underlined amber; it pulses while thinking.").addDropdown((drop) => drop.addOption("fast", "Fast").addOption("auto", "Auto").addOption("always", "Always").setValue(thinkingMode).onChange((value) => this.plugin.setThinkingMode(value)));
     if (promptId === CUSTOM_PROMPT_ID) {
@@ -855,6 +993,8 @@ var FastTyperPlugin = class extends import_obsidian.Plugin {
       correctionsPaused = true;
     if (typeof (data == null ? void 0 : data.capitalizeInitials) === "boolean")
       capitalizeInitials = data.capitalizeInitials;
+    if (typeof (data == null ? void 0 : data.loggingEnabled) === "boolean")
+      loggingEnabled = data.loggingEnabled;
     if (typeof (data == null ? void 0 : data.promptId) === "string")
       promptId = data.promptId;
     if (typeof (data == null ? void 0 : data.customSystem) === "string")
@@ -941,6 +1081,13 @@ var FastTyperPlugin = class extends import_obsidian.Plugin {
     await this.saveSettings();
     (_a = this.settingsTab) == null ? void 0 : _a.display();
   }
+  /** Toggle LLM exchange logging to the vault note and persist. */
+  async setLoggingEnabled(value) {
+    var _a;
+    loggingEnabled = value;
+    await this.saveSettings();
+    (_a = this.settingsTab) == null ? void 0 : _a.display();
+  }
   /** Select the active prompt preset (`A`/`B`/`E`/`C`/`custom`) and persist. */
   async setPromptId(id) {
     var _a;
@@ -968,7 +1115,7 @@ var FastTyperPlugin = class extends import_obsidian.Plugin {
   }
   /** Persist the current settings to plugin data. */
   async saveSettings() {
-    await this.saveData({ paused: correctionsPaused, capitalizeInitials, promptId, customSystem, customUser, thinkingMode, llmUrl: LLM_URL, llmBase: LLM_BASE, model: MODEL });
+    await this.saveData({ paused: correctionsPaused, capitalizeInitials, loggingEnabled, promptId, customSystem, customUser, thinkingMode, llmUrl: LLM_URL, llmBase: LLM_BASE, model: MODEL });
   }
   /** Push the current pause state to every open editor's corrector instance. */
   applyPauseState() {

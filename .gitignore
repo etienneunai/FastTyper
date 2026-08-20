@@ -3,7 +3,9 @@ obsidian-plugin/node_modules/
 browser-extension/node_modules/
 browser-extension/dist/
 
-# Runtime log (contains the user's typed text + LLM request/response payloads)
+# Runtime log — the exchange log now lives in the vault (FastTyper-LLM-Log.md),
+# written via the plugin's "Log LLM exchanges" setting, not the repo.
+# (Stale entry kept in case an old build still writes here.)
 llm-log.txt
 
 # Debug / instrumentation logs

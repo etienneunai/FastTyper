@@ -65,16 +65,32 @@ const PROMPT_PRESETS: PromptPreset[] = [
     }
 ];
 
-/** Absolute path to the LLM exchange log (FastTyper repo root). */
-const LLM_LOG_PATH = "/home/etienne/Projects/FastTyper/llm-log.txt";
+/** Vault-relative path of the LLM exchange log note (vault root). */
+const LLM_LOG_PATH = "FastTyper-LLM-Log.md";
+
+/** When true, every LLM exchange is appended to LLM_LOG_PATH (settings toggle, default off). */
+let loggingEnabled = false;
 
 /** Common abbreviations whose trailing period is not a sentence end. */
 const ABBREVIATIONS = new Set(["e.g.", "i.e.", "etc.", "Mr.", "Mrs.", "Ms.", "Dr.", "St.", "vs.", "no."]);
 
-/** Log an exchange. (Disabled in production: cannot use node 'fs' in Obsidian plugins). */
+/**
+ * Append one exchange to LLM_LOG_PATH as markdown. Gated by the "Log LLM
+ * exchanges" settings toggle (default off), so the published build ships with
+ * logging inactive but re-enablable in Settings — no source edit needed. Uses
+ * the vault adapter (sanctioned API; no node 'fs'), so it works everywhere.
+ */
 function logExchange(sent: string, received: string): void {
-    // Logging to file system removed for store publishing.
-    // To restore for local debugging, use app.vault.adapter.append()
+    if (!loggingEnabled) return;
+    try {
+        const app = (window as unknown as { app?: App }).app;
+        if (!app?.vault?.adapter) return;
+        const ts = new Date().toISOString();
+        const entry = `\n## ${ts}\n\n**sent**\n\n\`\`\`text\n${sent}\n\`\`\`\n\n**received**\n\n\`\`\`json\n${received}\n\`\`\`\n`;
+        void app.vault.adapter.append(LLM_LOG_PATH, entry);
+    } catch (e) {
+        console.error("FastTyper: failed to write LLM log", e);
+    }
 }
 
 export const setCorrections = StateEffect.define<AppliedCorrection[]>();
@@ -314,6 +330,108 @@ function isInstructionEcho(corrected: string): boolean {
     return ECHO_MARKERS.some(m => c.includes(m));
 }
 
+/**
+ * Signature of the emphasis/strong/strikethrough delimiter runs (`*`, `_`, `~`)
+ * in `text`, capturing count + length + order (so `**` ≠ `*` ≠ `_`). Used to
+ * reject a model reply that adds, removes, or repositions markdown emphasis
+ * markers — e.g. `**important**` "tidied" into `important`. Runs are not
+ * position-bound, so fixing a typo inside `**bold**` leaves the signature
+ * unchanged and the correction still applies.
+ */
+function markdownSignature(text: string): string {
+    const runs: string[] = [];
+    for (let i = 0; i < text.length; i++) {
+        const c = text[i];
+        if (c === '*' || c === '_' || c === '~') {
+            let j = i;
+            while (j < text.length && text[j] === c) j++;
+            runs.push(c.repeat(j - i));
+            i = j - 1;
+        }
+    }
+    return runs.join("|");
+}
+
+/**
+ * Obsidian-link protection. Wikilink/embed contents (`[[…]]`, `![[…]]`) are
+ * masked with a same-length placeholder before the text is sent to the model, so
+ * it never sees filenames, URLs, or tags and can't "fix" them. Because the mask
+ * preserves length and the brackets, every non-link character stays at the same
+ * offset; after the response, the model must have left each link structurally
+ * intact (same bracket count, same inner length) or the correction is rejected,
+ * then the original contents are restored before diffing. The LCS then aligns the
+ * identical link substrings, so no hunk can touch link content while the rest of
+ * the sentence is corrected normally.
+ */
+
+/** One `[[` link span: `to`-`from` covers `[[…]]` (or `[[…` to end if `closed` is false). */
+interface LinkSpan { from: number; to: number; inner: string; closed: boolean }
+
+/** Find all Obsidian link spans in `s` (closed `[[…]]`, plus a trailing unclosed `[[…`). */
+function linkSpans(s: string): LinkSpan[] {
+    const spans: LinkSpan[] = [];
+    let i = 0;
+    while (i < s.length - 1) {
+        if (s[i] === "[" && s[i + 1] === "[") {
+            const close = s.indexOf("]]", i + 2);
+            if (close === -1) {
+                spans.push({ from: i, to: s.length, inner: s.slice(i + 2), closed: false });
+                break;
+            }
+            spans.push({ from: i, to: close + 2, inner: s.slice(i + 2, close), closed: true });
+            i = close + 2;
+        } else {
+            i++;
+        }
+    }
+    return spans;
+}
+
+/** Replace every link's inner content with a same-length `·` run (length preserved). */
+function maskLinks(s: string): { masked: string; links: LinkSpan[] } {
+    const spans = linkSpans(s);
+    if (spans.length === 0) return { masked: s, links: [] };
+    let out = "";
+    let last = 0;
+    for (const sp of spans) {
+        out += s.slice(last, sp.from + 2);              // up to and including `[[`
+        out += "·".repeat(sp.inner.length);
+        out += sp.closed ? s.slice(sp.to - 2, sp.to) : ""; // `]]` (absent when unclosed)
+        last = sp.to;
+    }
+    out += s.slice(last);
+    return { masked: out, links: spans };
+}
+
+/** True if `corrected`'s link structure matches `text`'s (count + inner lengths + closed/unclosed). */
+function linksIntact(text: string, corrected: string): boolean {
+    const a = linkSpans(text);
+    const b = linkSpans(corrected);
+    if (a.length !== b.length) return false;
+    for (let i = 0; i < a.length; i++) {
+        if (a[i].inner.length !== b[i].inner.length) return false;
+        if (a[i].closed !== b[i].closed) return false;
+    }
+    return true;
+}
+
+/** Replace each link in `corrected` with the matching original inner content (by order). */
+function restoreLinks(corrected: string, links: LinkSpan[]): string {
+    const spans = linkSpans(corrected);
+    if (spans.length === 0) return corrected;
+    let out = "";
+    let last = 0;
+    for (let k = 0; k < spans.length; k++) {
+        const sp = spans[k];
+        out += corrected.slice(last, sp.from + 2);      // up to and including `[[`
+        out += links[k].inner;                          // original content, not the placeholder
+        out += sp.closed ? corrected.slice(sp.to - 2, sp.to) : "";
+        last = sp.to;
+    }
+    out += corrected.slice(last);
+    return out;
+}
+
 const MAX_CHAR_DIFF_CELLS = 4_000_000;
 const diffBuffer = new Int32Array(MAX_CHAR_DIFF_CELLS + 2000);
 
@@ -526,6 +644,17 @@ const grammarCheckerPlugin = ViewPlugin.fromClass(class {
                 if (fromA !== toA && !s.includes('\n')) return;
                 for (let k = s.length - 1; k >= 0; k--) {
                     const c = s[k];
+                    // A "." that is a list-marker dot ("5." in a numbered item) is
+                    // not a sentence end. Skip it so a numbered-list continuation
+                    // transaction ("\n5. ") still resolves to the "\n" — exactly
+                    // like a bullet continuation ("\n- "). Without this, the "."
+                    // is the rightmost trigger char and fires a punctuation
+                    // trigger on the 2-char marker, which MIN_UNIT_CHARS drops.
+                    // Guard with includes('\n') so a paste ending in e.g. "42."
+                    // (no newline) still fires the "." trigger normally.
+                    if (c === '.' && /\d/.test(s[k - 1] ?? "") && /\s/.test(s[k + 1] ?? "") && s.includes('\n')) {
+                        continue;
+                    }
                     if (c === '.' || c === '?' || c === '!' || c === '\n') {
                         found = { pos: fromB + k, ch: c };
                         break;
@@ -583,6 +712,7 @@ const grammarCheckerPlugin = ViewPlugin.fromClass(class {
         if (span.to - span.from > MAX_UNIT_CHARS) return;
         if (doc.sliceString(span.from, span.to).trim().length < MIN_UNIT_CHARS) return;
         if (this.containsCode(span.from, span.to)) return;
+        if (this.containsMath(span.from, span.to)) return;
 
         this.queue.push(span);
         this.maybeFire();
@@ -691,6 +821,22 @@ const grammarCheckerPlugin = ViewPlugin.fromClass(class {
         return found;
     }
 
+    /** True if the range overlaps math (`$…$` inline or `$$…$$` block). */
+    private containsMath(from: number, to: number): boolean {
+        let found = false;
+        syntaxTree(this.view.state).iterate({
+            from,
+            to,
+            enter: (node) => {
+                if (node.name.includes("Math")) {
+                    found = true;
+                    return false;
+                }
+            }
+        });
+        return found;
+    }
+
     /** Map a span forward through a change set (keeps it accurate while the user types). */
     private mapSpan(span: { from: number; to: number }, changes: ChangeSet): { from: number; to: number } {
         return { from: changes.mapPos(span.from, 1), to: changes.mapPos(span.to, -1) };
@@ -718,6 +864,7 @@ const grammarCheckerPlugin = ViewPlugin.fromClass(class {
                 const lead = raw.length - raw.trimStart().length;
                 if (text.length < MIN_UNIT_CHARS) return;
                 if (this.containsCode(this.pending.from, this.pending.to)) return;
+                if (this.containsMath(this.pending.from, this.pending.to)) return;
                 this.pending.text = text;
                 this.pending.lead = lead;
 
@@ -815,18 +962,23 @@ const grammarCheckerPlugin = ViewPlugin.fromClass(class {
      * leaves unchanged (6/10), at ~6–12 s instead of ~0.4 s.
      */
     private async request(text: string, signal: AbortSignal, thinking: boolean): Promise<string | null> {
+        // Mask Obsidian link contents so the model never sees filenames/URLs/tags
+        // (see the link-protection helpers above). The masked string keeps every
+        // non-link character at the same offset; links are restored after the
+        // guards below, so the caller's diff sees the original link text verbatim.
+        const { masked, links } = maskLinks(text);
         const prompt = thinking ? PROMPT_PRESETS.find(p => p.id === "E") ?? PROMPT_PRESETS[0] : activePrompt();
         const payload = {
             model: MODEL,
             messages: [
                 { role: "system", content: prompt.system },
-                { role: "user", content: prompt.user.split("{text}").join(text) }
+                { role: "user", content: prompt.user.split("{text}").join(masked) }
             ],
             temperature: 0,
             // Thinking needs headroom for the reasoning block; flat stays capped
             // by text length. Never let a runaway thinking pass burn the whole
             // budget and return empty (see reasoning_budget_tokens below).
-            max_tokens: thinking ? 2048 : Math.min(2048, Math.ceil(text.length / 3) + 256),
+            max_tokens: thinking ? 2048 : Math.min(2048, Math.ceil(masked.length / 3) + 256),
             chat_template_kwargs: { enable_thinking: thinking },
             // Per-request reasoning cap: force-emits the end-of-thinking tag when
             // exhausted, so the model can't burn max_tokens on reasoning_content
@@ -862,12 +1014,30 @@ const grammarCheckerPlugin = ViewPlugin.fromClass(class {
         }
 
         const content = data.choices[0].message.content;
-        const corrected = parseResponse(content);
+        // Log the raw message (incl. reasoning_content) before the guards below, so
+        // exchanges the guards reject are still visible while debugging.
+        logExchange(text, JSON.stringify(data.choices[0].message));
+        let corrected = parseResponse(content);
         if (!corrected) return null;
         // Echo guards: (1) the model must not repeat the instruction back (the v4
         // proof prompt can echo on short/hard inputs — catastrophic, would replace
-        // the text with the prompt); (2) it must not balloon the input 2x+200 chars.
+        // the text with the prompt); (2) it must not balloon the input 2x+200 chars;
+        // (3) it must not add, remove, or reposition emphasis/strong/strikethrough
+        // markers (`*`, `_`, `~`) — word fixes inside `**bold**` are fine (the runs
+        // survive), but "tidying" `**x**` → `x` is rejected.
         if (isInstructionEcho(corrected)) return null;
+        // Compare emphasis signatures in MASKED space: the mask hides any `*`/`_`/`~`
+        // inside link contents (e.g. `[[my_note]]`), which the model must never see.
+        if (markdownSignature(masked) !== markdownSignature(corrected)) return null;
+        // Link integrity: the model must have left every link structurally intact
+        // (same bracket count, same inner length, same closed/unclosed state) — any
+        // added/removed/repositioned link means it tried to "fix" one, so the whole
+        // correction is rejected. Runs unconditionally: when `text` had no links it
+        // still catches the model hallucinating `[[...]]` into link-free prose.
+        // Then restore the original inner contents (the model only ever saw `·` runs);
+        // this is a no-op when neither text nor corrected has links.
+        if (!linksIntact(text, corrected)) return null;
+        corrected = restoreLinks(corrected, links);
         if (corrected.length > text.length * 2 + 200) return null;
         return corrected;
     }
@@ -966,6 +1136,13 @@ class FastTyperSettingTab extends PluginSettingTab {
                 .onChange(value => this.plugin.setCapitalizeInitials(value)));
 
         new Setting(containerEl)
+            .setName("Log LLM exchanges")
+            .setDesc("Append every request/response to FastTyper-LLM-Log.md in the vault root (a debugging aid — off by default).")
+            .addToggle(toggle => toggle
+                .setValue(loggingEnabled)
+                .onChange(value => this.plugin.setLoggingEnabled(value)));
+
+        new Setting(containerEl)
             .setName("Correction prompt")
             .setDesc("Which prompt to send the model. A — prod: the default, spelling-only, never corrupts correct text. B — gram: adds missing spaces and a/an, keeps A's safety and speed. E — proof: most capable (a/an, apostrophes, run-together) but slow — emits a ~340-token reasoning block per request (6–25 s). C — clean: fixes a/an and run-together but unreliable (empty outputs, mid-sentence truncation) — a correction risk. Custom: edit both messages.")
             .addDropdown(drop => drop
@@ -1029,6 +1206,7 @@ export default class FastTyperPlugin extends Plugin {
         const data = await this.loadData();
         if (data?.paused) correctionsPaused = true;
         if (typeof data?.capitalizeInitials === "boolean") capitalizeInitials = data.capitalizeInitials;
+        if (typeof data?.loggingEnabled === "boolean") loggingEnabled = data.loggingEnabled;
         if (typeof data?.promptId === "string") promptId = data.promptId;
         if (typeof data?.customSystem === "string") customSystem = data.customSystem;
         if (typeof data?.customUser === "string") customUser = data.customUser;
@@ -1116,6 +1294,13 @@ export default class FastTyperPlugin extends Plugin {
         this.settingsTab?.display();
     }
 
+    /** Toggle LLM exchange logging to the vault note and persist. */
+    async setLoggingEnabled(value: boolean) {
+        loggingEnabled = value;
+        await this.saveSettings();
+        this.settingsTab?.display();
+    }
+
     /** Select the active prompt preset (`A`/`B`/`E`/`C`/`custom`) and persist. */
     async setPromptId(id: string) {
         promptId = id;
@@ -1145,7 +1330,7 @@ export default class FastTyperPlugin extends Plugin {
 
     /** Persist the current settings to plugin data. */
     async saveSettings() {
-        await this.saveData({ paused: correctionsPaused, capitalizeInitials, promptId, customSystem, customUser, thinkingMode, llmUrl: LLM_URL, llmBase: LLM_BASE, model: MODEL });
+        await this.saveData({ paused: correctionsPaused, capitalizeInitials, loggingEnabled, promptId, customSystem, customUser, thinkingMode, llmUrl: LLM_URL, llmBase: LLM_BASE, model: MODEL });
     }
 
     /** Push the current pause state to every open editor's corrector instance. */

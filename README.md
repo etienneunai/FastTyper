@@ -10,7 +10,7 @@ Fully-local, low-latency grammar correction. A `llama.cpp` daemon runs a purpose
 4. **Revert** — Each correction gets a wavy underline. Hovering shows the original typo with surrounding context; click to revert.
 5. **Resend-on-conflict** — If you keep typing while a request is in flight, the plugin detects the span changed and **re-sends the current text** (up to 3 retries) instead of inserting stale text. Only one request is in flight at a time; later triggers queue.
 6. **Capitalization** — Sentence-initial letters are capitalized deterministically in the plugin (the model is spelling-only and won't do it). Toggleable in settings.
-7. **Log** — File logging is disabled in the published plugin. For local debugging, restore `logExchange()` in `src/main.ts` using `app.vault.adapter.append()`.
+7. **Log** — Every request/response can be appended to a `FastTyper-LLM-Log.md` note in the vault root via Settings → FastTyper → **Log LLM exchanges** (off by default).
 
 ## Models
 
@@ -64,7 +64,7 @@ npm run build                    # esbuild → main.js (tsc must also pass)
 Copy the output into your vault:
 
 ```bash
-cp -r {main.js,manifest.json,styles.css} ~/path/to/YourVault/.obsidian/plugins/fasttyper/
+cp -r {main.js,manifest.json,styles.css,wordlist.json} ~/path/to/YourVault/.obsidian/plugins/fasttyper/
 ```
 
 Then reload Obsidian (Ctrl-R) and enable the plugin under **Settings → Community plugins**.
@@ -138,4 +138,4 @@ build. (For a permanent install, sign it on addons.mozilla.org or use
 
 ## Privacy
 
-Fully local — no data leaves your machine. Note that `llm-log.txt` (in the repo root when running) records every sentence sent and the raw model response; it is gitignored.
+Fully local — no data leaves your machine. When the **Log LLM exchanges** setting is on, every sentence sent and the raw model response are appended to `FastTyper-LLM-Log.md` in the vault root.

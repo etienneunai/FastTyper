@@ -4,17 +4,12 @@ After=network.target
 
 [Service]
 Type=simple
-Environment="AMD_VULKAN_ASYNC_COMPUTE=1"
-# Force 780M iGPU, ignoring CPU fallbacks and the 4060 dGPU.
-# NOTE: the ICD file on Arch/CachyOS is `radeon_icd.json` (no `.x86_64` suffix —
-# that's a Debian naming convention). A wrong path loads zero ICDs and silently
-# falls back to CPU.
+Environment="PORT=8808"
+Environment="HOST=127.0.0.1"
 Environment="VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/radeon_icd.json"
-# llama-server's shared libs (libllama-server-impl.so, libllama-*.so.0) are
-# installed to /usr/local/lib by `cmake --install`. /usr/local/lib isn't on
-# Arch's default ldconfig search path, so point the loader at it directly —
-# this keeps the daemon working even if the linker cache isn't rebuilt.
-Environment="LD_LIBRARY_PATH=/usr/local/lib"
+Environment="AMD_VULKAN_ASYNC_COMPUTE=1"
+EnvironmentFile=-%h/.config/fasttyper/config
+EnvironmentFile=-/etc/fasttyper/config
 # -ngl 99: Offload all layers
 # -cb: Continuous batching
 # --split-mode none: Optimal for UMA iGPUs
@@ -26,8 +21,8 @@ Environment="LD_LIBRARY_PATH=/usr/local/lib"
 #   empty output (see llm-log.txt). This makes the model answer directly.
 ExecStart=/usr/local/bin/llama-server \
   -m %h/.local/share/models/dyslexic-writer-qwen3-4b-q4_k_m.gguf \
-  --port 8808 \
-  --host 127.0.0.1 \
+  --port $PORT \
+  --host $HOST \
   -ngl 99 \
   -cb \
   --split-mode none \

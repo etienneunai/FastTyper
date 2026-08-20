@@ -1,8 +1,7 @@
-import { App, MarkdownView, Notice, Plugin, PluginSettingTab, Setting } from 'obsidian';
+import { App, MarkdownView, Notice, Plugin, PluginSettingTab, Setting, requestUrl } from 'obsidian';
 import { StateField, StateEffect, Transaction, ChangeSet, type Range, type Text } from '@codemirror/state';
 import { Decoration, DecorationSet, EditorView, ViewPlugin, ViewUpdate, hoverTooltip, WidgetType } from '@codemirror/view';
 import { syntaxTree } from '@codemirror/language';
-import WORD_LIST from "./wordlist.json";
 
 interface AppliedCorrection {
     from: number;
@@ -18,8 +17,9 @@ interface DiffHunk {
     replacement: string;
 }
 
-const LLM_URL = "http://127.0.0.1:8808/v1/chat/completions";
-const MODEL = "dyslexic-writer-qwen3-4b-q4_k_m.gguf";
+let LLM_URL = "http://127.0.0.1:8808/v1/chat/completions";
+let LLM_BASE = "http://127.0.0.1:8808";
+let MODEL = "dyslexic-writer-qwen3-4b-q4_k_m.gguf";
 /** Wait after a trigger char insertion to make sure the user didn't delete it. */
 const TRIGGER_VERIFY_MS = 100;
 /** Skip units longer than this (sentences are short; keeps the 4B model's latency sane). */
@@ -65,25 +65,29 @@ const PROMPT_PRESETS: PromptPreset[] = [
     }
 ];
 
-/** Absolute path to the LLM exchange log (FastTyper repo root). */
-const LLM_LOG_PATH = "/home/etienne/Projects/FastTyper/llm-log.txt";
+/** Vault-relative path of the LLM exchange log note (vault root). */
+const LLM_LOG_PATH = "FastTyper-LLM-Log.md";
+
+/** When true, every LLM exchange is appended to LLM_LOG_PATH (settings toggle, default off). */
+let loggingEnabled = false;
 
 /** Common abbreviations whose trailing period is not a sentence end. */
 const ABBREVIATIONS = new Set(["e.g.", "i.e.", "etc.", "Mr.", "Mrs.", "Ms.", "Dr.", "St.", "vs.", "no."]);
 
-declare const require: (id: string) => any;
-
-let fsModule: any = null;
-/** Append one `sent:\n…\nreceived:\n…` exchange to LLM_LOG_PATH. */
+/**
+ * Append one exchange to LLM_LOG_PATH as markdown. Gated by the "Log LLM
+ * exchanges" settings toggle (default off), so the published build ships with
+ * logging inactive but re-enablable in Settings — no source edit needed. Uses
+ * the vault adapter (sanctioned API; no node 'fs'), so it works everywhere.
+ */
 function logExchange(sent: string, received: string): void {
+    if (!loggingEnabled) return;
     try {
-        if (fsModule === null) {
-            try { fsModule = require("fs"); } catch { fsModule = false; }
-        }
-        if (!fsModule) return;
+        const app = (window as unknown as { app?: App }).app;
+        if (!app?.vault?.adapter) return;
         const ts = new Date().toISOString();
-        const entry = `--- ${ts} ---\nsent:\n${sent}\nreceived:\n${received}\n\n`;
-        fsModule.appendFileSync(LLM_LOG_PATH, entry, "utf8");
+        const entry = `\n## ${ts}\n\n**sent**\n\n\`\`\`text\n${sent}\n\`\`\`\n\n**received**\n\n\`\`\`json\n${received}\n\`\`\`\n`;
+        void app.vault.adapter.append(LLM_LOG_PATH, entry);
     } catch (e) {
         console.error("FastTyper: failed to write LLM log", e);
     }
@@ -202,12 +206,15 @@ export const processingField = StateField.define<{ from: number; to: number; thi
             if (state.from >= state.to) state = null; // unit deleted/collapsed mid-flight
         }
         for (const e of tr.effects) {
-            if (e.is(setProcessing)) state = e.value;
+            if (e.is(setProcessing)) {
+                if (e.value && e.value.from < e.value.to) state = e.value;
+                else state = null;
+            }
         }
         return state;
     },
     provide: (f) => EditorView.decorations.from(f, (s) =>
-        s
+        (s && s.from < s.to)
             ? Decoration.set([Decoration.mark({
                 class: s.thinking ? "ft-processing ft-processing-thinking" : "ft-processing"
             }).range(s.from, s.to)])
@@ -323,7 +330,110 @@ function isInstructionEcho(corrected: string): boolean {
     return ECHO_MARKERS.some(m => c.includes(m));
 }
 
+/**
+ * Signature of the emphasis/strong/strikethrough delimiter runs (`*`, `_`, `~`)
+ * in `text`, capturing count + length + order (so `**` ≠ `*` ≠ `_`). Used to
+ * reject a model reply that adds, removes, or repositions markdown emphasis
+ * markers — e.g. `**important**` "tidied" into `important`. Runs are not
+ * position-bound, so fixing a typo inside `**bold**` leaves the signature
+ * unchanged and the correction still applies.
+ */
+function markdownSignature(text: string): string {
+    const runs: string[] = [];
+    for (let i = 0; i < text.length; i++) {
+        const c = text[i];
+        if (c === '*' || c === '_' || c === '~') {
+            let j = i;
+            while (j < text.length && text[j] === c) j++;
+            runs.push(c.repeat(j - i));
+            i = j - 1;
+        }
+    }
+    return runs.join("|");
+}
+
+/**
+ * Obsidian-link protection. Wikilink/embed contents (`[[…]]`, `![[…]]`) are
+ * masked with a same-length placeholder before the text is sent to the model, so
+ * it never sees filenames, URLs, or tags and can't "fix" them. Because the mask
+ * preserves length and the brackets, every non-link character stays at the same
+ * offset; after the response, the model must have left each link structurally
+ * intact (same bracket count, same inner length) or the correction is rejected,
+ * then the original contents are restored before diffing. The LCS then aligns the
+ * identical link substrings, so no hunk can touch link content while the rest of
+ * the sentence is corrected normally.
+ */
+
+/** One `[[` link span: `to`-`from` covers `[[…]]` (or `[[…` to end if `closed` is false). */
+interface LinkSpan { from: number; to: number; inner: string; closed: boolean }
+
+/** Find all Obsidian link spans in `s` (closed `[[…]]`, plus a trailing unclosed `[[…`). */
+function linkSpans(s: string): LinkSpan[] {
+    const spans: LinkSpan[] = [];
+    let i = 0;
+    while (i < s.length - 1) {
+        if (s[i] === "[" && s[i + 1] === "[") {
+            const close = s.indexOf("]]", i + 2);
+            if (close === -1) {
+                spans.push({ from: i, to: s.length, inner: s.slice(i + 2), closed: false });
+                break;
+            }
+            spans.push({ from: i, to: close + 2, inner: s.slice(i + 2, close), closed: true });
+            i = close + 2;
+        } else {
+            i++;
+        }
+    }
+    return spans;
+}
+
+/** Replace every link's inner content with a same-length `·` run (length preserved). */
+function maskLinks(s: string): { masked: string; links: LinkSpan[] } {
+    const spans = linkSpans(s);
+    if (spans.length === 0) return { masked: s, links: [] };
+    let out = "";
+    let last = 0;
+    for (const sp of spans) {
+        out += s.slice(last, sp.from + 2);              // up to and including `[[`
+        out += "·".repeat(sp.inner.length);
+        out += sp.closed ? s.slice(sp.to - 2, sp.to) : ""; // `]]` (absent when unclosed)
+        last = sp.to;
+    }
+    out += s.slice(last);
+    return { masked: out, links: spans };
+}
+
+/** True if `corrected`'s link structure matches `text`'s (count + inner lengths + closed/unclosed). */
+function linksIntact(text: string, corrected: string): boolean {
+    const a = linkSpans(text);
+    const b = linkSpans(corrected);
+    if (a.length !== b.length) return false;
+    for (let i = 0; i < a.length; i++) {
+        if (a[i].inner.length !== b[i].inner.length) return false;
+        if (a[i].closed !== b[i].closed) return false;
+    }
+    return true;
+}
+
+/** Replace each link in `corrected` with the matching original inner content (by order). */
+function restoreLinks(corrected: string, links: LinkSpan[]): string {
+    const spans = linkSpans(corrected);
+    if (spans.length === 0) return corrected;
+    let out = "";
+    let last = 0;
+    for (let k = 0; k < spans.length; k++) {
+        const sp = spans[k];
+        out += corrected.slice(last, sp.from + 2);      // up to and including `[[`
+        out += links[k].inner;                          // original content, not the placeholder
+        out += sp.closed ? corrected.slice(sp.to - 2, sp.to) : "";
+        last = sp.to;
+    }
+    out += corrected.slice(last);
+    return out;
+}
+
 const MAX_CHAR_DIFF_CELLS = 4_000_000;
+const diffBuffer = new Int32Array(MAX_CHAR_DIFF_CELLS + 2000);
 
 /**
  * Char-level LCS diff of two strings → minimal, ordered hunks `{from,to,replacement}`
@@ -334,7 +444,7 @@ function charDiff(a: string, b: string): DiffHunk[] {
     if (n * m > MAX_CHAR_DIFF_CELLS) return a === b ? [] : [{ from: 0, to: n, replacement: b }];
 
     const width = m + 1;
-    const dp = new Int32Array((n + 1) * width);
+    const dp = diffBuffer;
     for (let i = n - 1; i >= 0; i--) {
         for (let j = m - 1; j >= 0; j--) {
             dp[i * width + j] = a.charCodeAt(i) === b.charCodeAt(j)
@@ -385,8 +495,8 @@ function diffWords(a: string, b: string): DiffHunk[] {
 
 // Lazy ~275k-word Set; built on first use (~40 ms) so plugin load stays cheap.
 let _wordSet: Set<string> | null = null;
-function wordSet(): Set<string> {
-    if (_wordSet === null) _wordSet = new Set<string>(WORD_LIST);
+function wordSet() {
+    if (_wordSet === null) return new Set<string>(); // safe fallback before loaded
     return _wordSet;
 }
 
@@ -398,13 +508,16 @@ function wordSet(): Set<string> {
  * wordlist can't judge those). Lone lowercase "i" is a real typo for "I" and *is*
  * a dictionary word, so it's flagged explicitly.
  */
+const SUSPECT_REGEX = /[a-z]+(?:'[a-z]+)*/gi;
+
 function hasSuspectTokens(text: string): boolean {
-    const re = /[a-z]+(?:'[a-z]+)*/gi;
+    if (_wordSet === null) return false;
+    SUSPECT_REGEX.lastIndex = 0;
     let m: RegExpExecArray | null;
-    while ((m = re.exec(text)) !== null) {
+    while ((m = SUSPECT_REGEX.exec(text)) !== null) {
         const raw = m[0];
         if (/\d/.test(text[m.index - 1] ?? "") || /\d/.test(text[m.index + raw.length] ?? "")) continue;
-        if (/[A-Z]/.test(raw)) continue;       // proper noun / sentence start
+        if (/[A-Z]/.test(raw)) continue;        // proper nouns + the capitalized sentence start
         const token = raw.toLowerCase();
         if (token.includes("'")) continue;      // don't, it's, James'
         if (token.length === 1) { if (token === "i") return true; continue; }
@@ -428,6 +541,12 @@ const grammarCheckerPlugin = ViewPlugin.fromClass(class {
     queue: { from: number; to: number }[] = [];
     destroyed: boolean = false;
     paused: boolean = false;
+    /**
+     * Bumped on every halt. `fire()` records its value at start and checks it
+     * after each await: a halted fire's result is discarded and its `finally`
+     * won't clobber the shared state if a newer fire has started meanwhile.
+     */
+    fireSeq: number = 0;
 
     constructor(view: EditorView) {
         this.view = view;
@@ -444,6 +563,29 @@ const grammarCheckerPlugin = ViewPlugin.fromClass(class {
             this.queue = [];
             if (this.abortController) this.abortController.abort();
         }
+    }
+
+    /**
+     * Halt the current correction: discard the in-flight request (its result is
+     * never applied), drop queued + pending-trigger work, and clear the amber
+     * processing underline. Unlike pause, this doesn't block future triggers —
+     * the next sentence is corrected normally. Returns true if there was work to
+     * halt. (Obsidian's `requestUrl` carries no abort signal, so the daemon may
+     * finish the request, but the response is discarded.)
+     */
+    halt(): boolean {
+        const hadWork = this.isPending || this.verifyTimeout !== null || this.queue.length > 0;
+        this.fireSeq++; // invalidate any in-flight fire so its result is discarded
+        if (this.verifyTimeout) { clearTimeout(this.verifyTimeout); this.verifyTimeout = null; }
+        this.verifyPos = null;
+        this.verifyChar = "";
+        this.queue = [];
+        if (this.abortController) this.abortController.abort();
+        this.abortController = null;
+        this.isPending = false;
+        this.pending = null;
+        if (!this.destroyed) this.view.dispatch({ effects: setProcessing.of(null) });
+        return hadWork;
     }
 
     destroy() {
@@ -502,6 +644,17 @@ const grammarCheckerPlugin = ViewPlugin.fromClass(class {
                 if (fromA !== toA && !s.includes('\n')) return;
                 for (let k = s.length - 1; k >= 0; k--) {
                     const c = s[k];
+                    // A "." that is a list-marker dot ("5." in a numbered item) is
+                    // not a sentence end. Skip it so a numbered-list continuation
+                    // transaction ("\n5. ") still resolves to the "\n" — exactly
+                    // like a bullet continuation ("\n- "). Without this, the "."
+                    // is the rightmost trigger char and fires a punctuation
+                    // trigger on the 2-char marker, which MIN_UNIT_CHARS drops.
+                    // Guard with includes('\n') so a paste ending in e.g. "42."
+                    // (no newline) still fires the "." trigger normally.
+                    if (c === '.' && /\d/.test(s[k - 1] ?? "") && /\s/.test(s[k + 1] ?? "") && s.includes('\n')) {
+                        continue;
+                    }
                     if (c === '.' || c === '?' || c === '!' || c === '\n') {
                         found = { pos: fromB + k, ch: c };
                         break;
@@ -541,6 +694,7 @@ const grammarCheckerPlugin = ViewPlugin.fromClass(class {
         // NOT count, so a line ending in an abbreviation still falls through to
         // the newline (line) trigger.
         if (ch === '\n') {
+            if (pos <= 0) return;
             const line = doc.lineAt(pos - 1);
             const lastNonWs = line.text.trimEnd();
             if (lastNonWs.length > 0) {
@@ -558,6 +712,7 @@ const grammarCheckerPlugin = ViewPlugin.fromClass(class {
         if (span.to - span.from > MAX_UNIT_CHARS) return;
         if (doc.sliceString(span.from, span.to).trim().length < MIN_UNIT_CHARS) return;
         if (this.containsCode(span.from, span.to)) return;
+        if (this.containsMath(span.from, span.to)) return;
 
         this.queue.push(span);
         this.maybeFire();
@@ -666,6 +821,22 @@ const grammarCheckerPlugin = ViewPlugin.fromClass(class {
         return found;
     }
 
+    /** True if the range overlaps math (`$…$` inline or `$$…$$` block). */
+    private containsMath(from: number, to: number): boolean {
+        let found = false;
+        syntaxTree(this.view.state).iterate({
+            from,
+            to,
+            enter: (node) => {
+                if (node.name.includes("Math")) {
+                    found = true;
+                    return false;
+                }
+            }
+        });
+        return found;
+    }
+
     /** Map a span forward through a change set (keeps it accurate while the user types). */
     private mapSpan(span: { from: number; to: number }, changes: ChangeSet): { from: number; to: number } {
         return { from: changes.mapPos(span.from, 1), to: changes.mapPos(span.to, -1) };
@@ -681,6 +852,7 @@ const grammarCheckerPlugin = ViewPlugin.fromClass(class {
     /** Correct `span`, re-sending (≤MAX_RETRIES) if the text changes while we wait. */
     private async fire(span: { from: number; to: number }) {
         this.isPending = true;
+        const mySeq = this.fireSeq;
         this.pending = { from: span.from, to: span.to, text: "", lead: 0 };
         // "auto" starts flat and escalates once (below) if flat changes nothing.
         let thinking = thinkingMode === "always";
@@ -692,6 +864,7 @@ const grammarCheckerPlugin = ViewPlugin.fromClass(class {
                 const lead = raw.length - raw.trimStart().length;
                 if (text.length < MIN_UNIT_CHARS) return;
                 if (this.containsCode(this.pending.from, this.pending.to)) return;
+                if (this.containsMath(this.pending.from, this.pending.to)) return;
                 this.pending.text = text;
                 this.pending.lead = lead;
 
@@ -707,7 +880,7 @@ const grammarCheckerPlugin = ViewPlugin.fromClass(class {
                     }
                     return;
                 }
-                if (this.destroyed || this.paused || this.abortController !== controller) return;
+                if (this.destroyed || this.paused || this.fireSeq !== mySeq || this.abortController !== controller) return;
                 this.abortController = null;
 
                 if (!corrected) return; // nothing usable from the model
@@ -746,11 +919,16 @@ const grammarCheckerPlugin = ViewPlugin.fromClass(class {
                 return;
             }
         } finally {
-            if (!this.destroyed) this.view.dispatch({ effects: setProcessing.of(null) });
-            this.isPending = false;
-            this.abortController = null;
-            this.pending = null;
-            this.maybeFire();
+            // Only the current fire resets the shared state — a halted fire that
+            // resolves after a newer one started must not clobber it (halt()
+            // already reset everything it needs to).
+            if (this.fireSeq === mySeq) {
+                if (!this.destroyed) this.view.dispatch({ effects: setProcessing.of(null) });
+                this.isPending = false;
+                this.abortController = null;
+                this.pending = null;
+                this.maybeFire();
+            }
         }
     }
 
@@ -784,18 +962,23 @@ const grammarCheckerPlugin = ViewPlugin.fromClass(class {
      * leaves unchanged (6/10), at ~6–12 s instead of ~0.4 s.
      */
     private async request(text: string, signal: AbortSignal, thinking: boolean): Promise<string | null> {
+        // Mask Obsidian link contents so the model never sees filenames/URLs/tags
+        // (see the link-protection helpers above). The masked string keeps every
+        // non-link character at the same offset; links are restored after the
+        // guards below, so the caller's diff sees the original link text verbatim.
+        const { masked, links } = maskLinks(text);
         const prompt = thinking ? PROMPT_PRESETS.find(p => p.id === "E") ?? PROMPT_PRESETS[0] : activePrompt();
         const payload = {
             model: MODEL,
             messages: [
                 { role: "system", content: prompt.system },
-                { role: "user", content: prompt.user.split("{text}").join(text) }
+                { role: "user", content: prompt.user.split("{text}").join(masked) }
             ],
             temperature: 0,
             // Thinking needs headroom for the reasoning block; flat stays capped
             // by text length. Never let a runaway thinking pass burn the whole
             // budget and return empty (see reasoning_budget_tokens below).
-            max_tokens: thinking ? 2048 : Math.min(2048, Math.ceil(text.length / 3) + 256),
+            max_tokens: thinking ? 2048 : Math.min(2048, Math.ceil(masked.length / 3) + 256),
             chat_template_kwargs: { enable_thinking: thinking },
             // Per-request reasoning cap: force-emits the end-of-thinking tag when
             // exhausted, so the model can't burn max_tokens on reasoning_content
@@ -810,36 +993,51 @@ const grammarCheckerPlugin = ViewPlugin.fromClass(class {
                 reasoning_budget_message: "Stop reasoning and answer now."
             } : {})
         };
-        const body = JSON.stringify(payload);
 
-        const response = await fetch(LLM_URL, {
+        const response = await requestUrl({
+            url: LLM_URL,
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body,
-            signal
+            body: JSON.stringify(payload),
+            throw: false,
         });
-        const rawBody = await response.text();
-        logExchange(body, rawBody);
 
-        if (!response.ok) {
+        if (response.status !== 200) {
             console.error("FastTyper: daemon returned", response.status);
             return null;
         }
-        let data: any;
-        try {
-            data = JSON.parse(rawBody);
-        } catch (e) {
+
+        const data = response.json;
+        if (!data?.choices?.[0]?.message?.content) {
+            console.error("FastTyper: unparseable response");
             return null;
         }
-        const content: unknown = data?.choices?.[0]?.message?.content;
-        if (typeof content !== "string") return null;
 
-        const corrected = parseResponse(content);
+        const content = data.choices[0].message.content;
+        // Log the raw message (incl. reasoning_content) before the guards below, so
+        // exchanges the guards reject are still visible while debugging.
+        logExchange(text, JSON.stringify(data.choices[0].message));
+        let corrected = parseResponse(content);
         if (!corrected) return null;
         // Echo guards: (1) the model must not repeat the instruction back (the v4
         // proof prompt can echo on short/hard inputs — catastrophic, would replace
-        // the text with the prompt); (2) it must not balloon the input 2x+200 chars.
+        // the text with the prompt); (2) it must not balloon the input 2x+200 chars;
+        // (3) it must not add, remove, or reposition emphasis/strong/strikethrough
+        // markers (`*`, `_`, `~`) — word fixes inside `**bold**` are fine (the runs
+        // survive), but "tidying" `**x**` → `x` is rejected.
         if (isInstructionEcho(corrected)) return null;
+        // Compare emphasis signatures in MASKED space: the mask hides any `*`/`_`/`~`
+        // inside link contents (e.g. `[[my_note]]`), which the model must never see.
+        if (markdownSignature(masked) !== markdownSignature(corrected)) return null;
+        // Link integrity: the model must have left every link structurally intact
+        // (same bracket count, same inner length, same closed/unclosed state) — any
+        // added/removed/repositioned link means it tried to "fix" one, so the whole
+        // correction is rejected. Runs unconditionally: when `text` had no links it
+        // still catches the model hallucinating `[[...]]` into link-free prose.
+        // Then restore the original inner contents (the model only ever saw `·` runs);
+        // this is a no-op when neither text nor corrected has links.
+        if (!linksIntact(text, corrected)) return null;
+        corrected = restoreLinks(corrected, links);
         if (corrected.length > text.length * 2 + 200) return null;
         return corrected;
     }
@@ -883,6 +1081,46 @@ class FastTyperSettingTab extends PluginSettingTab {
         const { containerEl } = this;
         containerEl.empty();
 
+        const statusSetting = new Setting(containerEl)
+            .setName("Daemon status")
+            .setDesc("Checking connection...");
+        
+        const checkStatus = async () => {
+            try {
+                const res = await requestUrl({ url: `${LLM_BASE}/v1/models` });
+                if (res.status === 200) {
+                    statusSetting.setDesc("🟢 Connected to daemon");
+                } else {
+                    statusSetting.setDesc(`🔴 Daemon error: HTTP ${res.status}`);
+                }
+            } catch (e) {
+                statusSetting.setDesc("🔴 Disconnected (daemon not running or unreachable)");
+            }
+        };
+        checkStatus();
+
+        new Setting(containerEl)
+            .setName("LLM Base URL")
+            .setDesc("The base URL of the llama.cpp daemon.")
+            .addText(text => text
+                .setValue(LLM_BASE)
+                .onChange(async (value) => {
+                    LLM_BASE = value;
+                    LLM_URL = `${value}/v1/chat/completions`;
+                    await this.plugin.saveSettings();
+                    checkStatus();
+                }));
+        
+        new Setting(containerEl)
+            .setName("Model Name")
+            .setDesc("The exact filename or identifier of the loaded model.")
+            .addText(text => text
+                .setValue(MODEL)
+                .onChange(async (value) => {
+                    MODEL = value;
+                    await this.plugin.saveSettings();
+                }));
+
         new Setting(containerEl)
             .setName("Pause corrections")
             .setDesc("Stop triggering new corrections. Applied corrections stay until accepted or reverted.")
@@ -896,6 +1134,13 @@ class FastTyperSettingTab extends PluginSettingTab {
             .addToggle(toggle => toggle
                 .setValue(capitalizeInitials)
                 .onChange(value => this.plugin.setCapitalizeInitials(value)));
+
+        new Setting(containerEl)
+            .setName("Log LLM exchanges")
+            .setDesc("Append every request/response to FastTyper-LLM-Log.md in the vault root (a debugging aid — off by default).")
+            .addToggle(toggle => toggle
+                .setValue(loggingEnabled)
+                .onChange(value => this.plugin.setLoggingEnabled(value)));
 
         new Setting(containerEl)
             .setName("Correction prompt")
@@ -943,6 +1188,13 @@ class FastTyperSettingTab extends PluginSettingTab {
                 .setButtonText("Accept all")
                 .setCta()
                 .onClick(() => this.plugin.acceptAll()));
+
+        new Setting(containerEl)
+            .setName("Halt current correction")
+            .setDesc("Discard the in-flight correction request — nothing is applied. Queued and pending-trigger units are dropped too. (Also a hotkey-bindable command: Settings → Hotkeys → 'FastTyper: Halt current correction'.)")
+            .addButton(button => button
+                .setButtonText("Halt")
+                .onClick(() => this.plugin.haltCurrent()));
     }
 }
 
@@ -954,10 +1206,19 @@ export default class FastTyperPlugin extends Plugin {
         const data = await this.loadData();
         if (data?.paused) correctionsPaused = true;
         if (typeof data?.capitalizeInitials === "boolean") capitalizeInitials = data.capitalizeInitials;
+        if (typeof data?.loggingEnabled === "boolean") loggingEnabled = data.loggingEnabled;
         if (typeof data?.promptId === "string") promptId = data.promptId;
         if (typeof data?.customSystem === "string") customSystem = data.customSystem;
         if (typeof data?.customUser === "string") customUser = data.customUser;
         if (data?.thinkingMode === "fast" || data?.thinkingMode === "auto" || data?.thinkingMode === "always") thinkingMode = data.thinkingMode;
+        if (typeof data?.llmUrl === "string") LLM_URL = data.llmUrl;
+        if (typeof data?.llmBase === "string") LLM_BASE = data.llmBase;
+        if (typeof data?.model === "string") MODEL = data.model;
+
+        // Async load wordlist to prevent blocking startup
+        this.app.vault.adapter.read(`${this.manifest.dir}/wordlist.json`).then(
+            text => _wordSet = new Set(JSON.parse(text))
+        ).catch(e => console.error("FastTyper: failed to load wordlist", e));
 
         this.addCommand({
             id: "accept-all-corrections",
@@ -976,6 +1237,11 @@ export default class FastTyperPlugin extends Plugin {
                 const next = thinkingMode === "fast" ? "auto" : thinkingMode === "auto" ? "always" : "fast";
                 this.setThinkingMode(next);
             }
+        });
+        this.addCommand({
+            id: "halt-corrections",
+            name: "Halt current correction",
+            callback: () => this.haltCurrent()
         });
 
         this.settingsTab = new FastTyperSettingTab(this.app, this);
@@ -1004,6 +1270,14 @@ export default class FastTyperPlugin extends Plugin {
         cv.dispatch({ effects: clearCorrections.of(null) });
     }
 
+    /** Discard the active editor's in-flight/queued corrections (nothing is applied). */
+    haltCurrent() {
+        const cv = this.activeCm();
+        if (!cv) return;
+        const halted = cv.plugin(grammarCheckerPlugin)?.halt() ?? false;
+        if (halted) new Notice("FastTyper: correction halted");
+    }
+
     /** Toggle corrections on/off across all open editors and persist the choice. */
     async setPaused(paused: boolean) {
         correctionsPaused = paused;
@@ -1016,6 +1290,13 @@ export default class FastTyperPlugin extends Plugin {
     /** Toggle sentence-initial capitalization and persist. */
     async setCapitalizeInitials(value: boolean) {
         capitalizeInitials = value;
+        await this.saveSettings();
+        this.settingsTab?.display();
+    }
+
+    /** Toggle LLM exchange logging to the vault note and persist. */
+    async setLoggingEnabled(value: boolean) {
+        loggingEnabled = value;
         await this.saveSettings();
         this.settingsTab?.display();
     }
@@ -1048,8 +1329,8 @@ export default class FastTyperPlugin extends Plugin {
     }
 
     /** Persist the current settings to plugin data. */
-    private async saveSettings() {
-        await this.saveData({ paused: correctionsPaused, capitalizeInitials, promptId, customSystem, customUser, thinkingMode });
+    async saveSettings() {
+        await this.saveData({ paused: correctionsPaused, capitalizeInitials, loggingEnabled, promptId, customSystem, customUser, thinkingMode, llmUrl: LLM_URL, llmBase: LLM_BASE, model: MODEL });
     }
 
     /** Push the current pause state to every open editor's corrector instance. */

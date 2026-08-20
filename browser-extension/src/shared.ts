@@ -6,9 +6,9 @@
  * trigger heuristics, same LCS diff, same capitalization, same model call.
  */
 
-export const LLM_URL = "http://127.0.0.1:8808/v1/chat/completions";
-export const LLM_BASE = "http://127.0.0.1:8808";
-export const MODEL = "dyslexic-writer-qwen3-4b-q4_k_m.gguf";
+// Default fallbacks used by background/popup settings
+export const DEFAULT_LLM_BASE = "http://127.0.0.1:8808";
+export const DEFAULT_MODEL = "dyslexic-writer-qwen3-4b-q4_k_m.gguf";
 
 /** Wait after a trigger char insertion to make sure the user didn't delete it. */
 export const TRIGGER_VERIFY_MS = 100;
@@ -63,6 +63,7 @@ export function parseResponse(content: string): string | null {
 }
 
 const MAX_CHAR_DIFF_CELLS = 4_000_000;
+const diffBuffer = new Int32Array(MAX_CHAR_DIFF_CELLS + 2000);
 
 /**
  * Char-level LCS diff of two strings → minimal, ordered hunks `{from,to,replacement}`
@@ -73,7 +74,9 @@ export function charDiff(a: string, b: string): DiffHunk[] {
   if (n * m > MAX_CHAR_DIFF_CELLS) return a === b ? [] : [{ from: 0, to: n, replacement: b }];
 
   const width = m + 1;
-  const dp = new Int32Array((n + 1) * width);
+  const dp = diffBuffer;
+  for (let j = 0; j <= m; j++) dp[n * width + j] = 0;
+  for (let i = 0; i <= n; i++) dp[i * width + m] = 0;
   for (let i = n - 1; i >= 0; i--) {
     for (let j = m - 1; j >= 0; j--) {
       dp[i * width + j] = a.charCodeAt(i) === b.charCodeAt(j)
@@ -116,8 +119,8 @@ export function charDiff(a: string, b: string): DiffHunk[] {
 export function diffWords(a: string, b: string): DiffHunk[] {
   return charDiff(a, b).filter((h) => {
     const orig = a.slice(h.from, h.to);
-    if (orig === h.replacement) return false;                       // identity
-    if (orig.trim() === "" && h.replacement.trim() === "") return false; // whitespace churn
+    if (orig === h.replacement) return false;
+    if (orig.trim() === "" && h.replacement.trim() === "" && orig.length === h.replacement.length) return false;
     return true;
   });
 }
@@ -211,9 +214,9 @@ export function resolvePrompt(promptId: string, customSystem: string, customUser
  * matrix proved fixes the hard dyslexic cases that flat inference leaves
  * unchanged. Keep in sync with obsidian-plugin/src/main.ts request().
  */
-export function buildPayload(text: string, prompt: ActivePrompt, thinking: boolean): Record<string, unknown> {
+export function buildPayload(model: string, text: string, prompt: ActivePrompt, thinking: boolean): Record<string, unknown> {
   return {
-    model: MODEL,
+    model: model,
     messages: [
       { role: "system", content: prompt.system },
       { role: "user", content: prompt.user.split("{text}").join(text) },
@@ -232,6 +235,8 @@ export function buildPayload(text: string, prompt: ActivePrompt, thinking: boole
 export type Request =
   | { type: "correct"; text: string; thinking: boolean }
   | { type: "acceptAll" }
+  | { type: "halt" }
+  | { type: "checkSuspects"; text: string }
   | { type: "getState" }
   | { type: "setPaused"; paused: boolean }
   | { type: "setCapitalize"; value: boolean }
@@ -240,11 +245,14 @@ export type Request =
   | { type: "setCustomUser"; value: string }
   | { type: "setBlacklist"; blacklist: string[] }
   | { type: "setThinkingMode"; thinkingMode: ThinkingMode }
+  | { type: "setLlmBase"; value: string }
+  | { type: "setModel"; value: string }
   | { type: "getLog" };
 
 export type Response =
   | { type: "correctResult"; corrected: string | null }
-  | { type: "state"; paused: boolean; capitalize: boolean; blacklist: string[]; daemonUp: boolean | null; promptId: string; customSystem: string; customUser: string; thinkingMode: ThinkingMode }
+  | { type: "checkSuspectsResult"; suspects: boolean }
+  | { type: "state"; paused: boolean; capitalize: boolean; blacklist: string[]; daemonUp: boolean | null; promptId: string; customSystem: string; customUser: string; thinkingMode: ThinkingMode; llmBase: string; model: string }
   | { type: "log"; entries: string[] };
 
 export interface LogEntry {
@@ -257,4 +265,5 @@ export interface LogEntry {
 /** Push-to-content-script settings/command messages (not request/response). */
 export type PushMsg =
   | { type: "settings"; paused: boolean; capitalize: boolean; blacklist: string[]; thinkingMode: ThinkingMode }
-  | { type: "acceptAll" };
+  | { type: "acceptAll" }
+  | { type: "halt" };

@@ -31,6 +31,9 @@ const context = await esbuild.context({
   outfile: "main.js",
 });
 
+import fs from "fs";
+fs.copyFileSync("src/wordlist.json", "wordlist.json");
+
 if (prod) {
   await context.rebuild();
   process.exit(0);

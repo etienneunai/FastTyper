@@ -95,56 +95,14 @@ SYS[C]=$'You are an English text cleaner.'
 USER[C]=$'Insert missing spaces between run-together words, fix spelling and a/an errors. Return only the corrected text.\n\n{text}'
 
 # ---- per-request worker (python3: build payload, POST, strip <think>, verdict) ----
-WORKER="$(mktemp)"
-trap 'rm -f "$WORKER"' EXIT
-cat > "$WORKER" <<'PY'
-import sys, json, re, urllib.request
-system, user, thinking, budget, model, url, expected, msg = sys.argv[1:9]
-payload = {
-    "model": model,
-    "messages": [{"role": "system", "content": system},
-                 {"role": "user", "content": user}],
-    "temperature": 0,
-    "max_tokens": 2048,
-    "chat_template_kwargs": {"enable_thinking": thinking.strip().lower() == "true"},
-}
-if budget:
-    payload["reasoning_budget_tokens"] = int(budget)
-if msg:
-    payload["reasoning_budget_message"] = msg
-req = urllib.request.Request(url, data=json.dumps(payload).encode(),
-                             headers={"Content-Type": "application/json"})
-out, error = "", ""
-try:
-    with urllib.request.urlopen(req, timeout=120) as r:
-        body = json.loads(r.read().decode())
-    content = (body["choices"][0]["message"].get("content") or "").strip()
-    content = re.sub(r"<think[\s\S]*?</think>", "", content)
-    i = content.find("<think")
-    if i != -1:
-        content = content[:i]
-    content = content.strip()
-    if len(content) >= 2 and content[0] == '"' and content[-1] == '"':
-        content = content[1:-1].strip()
-    out = content
-except Exception as e:
-    error = "%s: %s" % (type(e).__name__, e)
-
-verdict = "ERROR" if error else ("SKIP" if not expected.strip() else "")
-if verdict == "":
-    def norm(s):
-        return " ".join(s.lower().split())
-    verdict = "PASS" if norm(expected) in norm(out) else "FAIL"
-print(json.dumps({"out": out, "verdict": verdict, "error": error}))
-PY
-
+WORKER="$(dirname "$0")/eval_worker.py"
 # ---- run ----
 echo "== $0  preset=$PRESET thinking=$THINK budget=${BUDGET:-unlimited} model=$MODEL =="
 echo "== corpus: $CORPUS =="
 n=0; passed=0; failed=0; skipped=0; errors=0
 times=()
 
-while IFS= read -r line; do
+while IFS= read -r line || [[ -n "$line" ]]; do
     line="${line%$'\r'}"
     case "$line" in ''|\#*) continue ;; esac
     input="$line"; expected=""
@@ -164,7 +122,7 @@ while IFS= read -r line; do
     out="$(jq -r '.out // ""' <<<"$resp" 2>/dev/null)"
     verdict="$(jq -r '.verdict // "ERROR"' <<<"$resp" 2>/dev/null)"
     err="$(jq -r '.error // ""' <<<"$resp" 2>/dev/null)"
-    if [[ "$rc" -ne 0 || -z "$resp" ]]; then
+    if [[ "$rc" -ne 0 || -z "$resp" || -z "$verdict" ]]; then
         verdict="ERROR"; err="worker failed (rc=$rc)"
     fi
 

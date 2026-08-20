@@ -23,7 +23,7 @@
 import {
   TRIGGER_VERIFY_MS, MAX_UNIT_CHARS, MIN_UNIT_CHARS, ABBREVIATIONS,
   diffWords, capitalizeInitial, contextSnippet,
-  type DiffHunk, type PushMsg, type ThinkingMode,
+  type DiffHunk, type PushMsg, type ThinkingMode, type Response
 } from "./shared";
 
 // Google Docs is canvas-rendered; the visible text isn't DOM text nodes.
@@ -85,6 +85,11 @@ browser.runtime.onMessage.addListener((msg: PushMsg) => {
     applySiteState();
   } else if (msg.type === "acceptAll") {
     acceptAll();
+  } else if (msg.type === "halt") {
+    // Drop the in-flight request (gen++ discards its result), queued units and
+    // the verify timer. The current field stays active, so the next sentence
+    // still corrects normally.
+    corrector.reset();
   }
 });
 
@@ -105,6 +110,8 @@ interface Field {
   replace(from: number, to: number, insert: string): number;
   /** Set the whole value (textarea path), firing an (untrusted) input event. */
   setValue(v: string): void;
+  /** Invalidate any cached DOM state after a mutation. */
+  invalidate(): void;
 }
 
 /** Blank-line-delimited paragraph start for textarea-style text. */
@@ -174,6 +181,8 @@ class SimpleField implements Field {
     setter.call(el, v);
     dispatchInput(el);
   }
+  
+  invalidate(): void {}
 }
 
 // ---------------------------------------------------------------------------
@@ -298,7 +307,16 @@ class ContentEditableField implements Field {
   el: HTMLElement;
   kind: "contenteditable" = "contenteditable";
   constructor(el: HTMLElement) { this.el = el; }
-  private model(): ContentModel { return buildModel(this.el); }
+  private _cachedModel: ContentModel | null = null;
+  private model(): ContentModel {
+    if (this._cachedModel) return this._cachedModel;
+    this._cachedModel = buildModel(this.el);
+    queueMicrotask(() => { this._cachedModel = null; });
+    return this._cachedModel;
+  }
+  invalidate(): void {
+    this._cachedModel = null;
+  }
   readText(): string { return this.model().text; }
   caret(): number { return modelCaret(this.el, this.model()); }
   setCaret(pos: number): void { setModelCaret(this.el, this.model(), pos); }
@@ -339,6 +357,15 @@ class ContentEditableField implements Field {
 // Skip rules (password / login / complex editors, etc.)
 // ---------------------------------------------------------------------------
 
+/** Return the topmost [contenteditable] ancestor of el (or el itself). */
+function contenteditableRoot(el: HTMLElement): HTMLElement {
+  let cur: HTMLElement = el;
+  while (cur.parentElement && cur.parentElement.isContentEditable) {
+    cur = cur.parentElement;
+  }
+  return cur;
+}
+
 function isEditableElement(el: unknown): el is HTMLElement {
   if (!(el instanceof HTMLElement)) return false;
   if (el instanceof HTMLTextAreaElement) return true;
@@ -370,11 +397,21 @@ function shouldSkip(el: HTMLElement): boolean {
   return false;
 }
 
+/** Weak cache: same DOM element always returns the same Field instance. */
+const fieldCache = new WeakMap<HTMLElement, Field>();
+
 function makeField(el: HTMLElement): Field | null {
   if (shouldSkip(el)) return null;
-  if (el instanceof HTMLTextAreaElement || el instanceof HTMLInputElement) return new SimpleField(el);
-  if (el.isContentEditable) return new ContentEditableField(el);
-  return null;
+  const cached = fieldCache.get(el);
+  if (cached) return cached;
+  let f: Field | null = null;
+  if (el instanceof HTMLTextAreaElement || el instanceof HTMLInputElement) {
+    f = new SimpleField(el);
+  } else if (el.isContentEditable) {
+    f = new ContentEditableField(el);
+  }
+  if (f) fieldCache.set(el, f);
+  return f;
 }
 
 // ---------------------------------------------------------------------------
@@ -423,7 +460,7 @@ interface QueuedUnit { field: Field; from: number; to: number; }
 class Corrector {
   private isPending = false;
   private gen = 0;
-  private queued: QueuedUnit | null = null;
+  private queued: QueuedUnit[] = [];
   private verifyTimer: ReturnType<typeof setTimeout> | null = null;
   private verifyPos: number | null = null;
   private verifyChar = "";
@@ -438,7 +475,7 @@ class Corrector {
     this.verifyPos = null;
     this.verifyChar = "";
     this.verifyField = null;
-    this.queued = null;
+    this.queued = [];
     this.isPending = false;
   }
 
@@ -461,14 +498,14 @@ class Corrector {
   }
 
   private confirm(): void {
-    this.verifyTimer = null;
+    if (this.verifyPos === null || !this.verifyField) return;
     const pos = this.verifyPos;
     const ch = this.verifyChar;
     const field = this.verifyField;
     this.verifyPos = null;
     this.verifyChar = "";
     this.verifyField = null;
-    if (paused || !field || pos === null) return;
+    this.verifyTimer = null;
 
     const text = field.readText();
     if (pos >= text.length || text[pos] !== ch) return;
@@ -495,14 +532,13 @@ class Corrector {
     // user is editing the corrected text — don't substitute over it again.
     if (hasAppliedOverlap(field, span.from, span.to)) return;
 
-    this.queued = { field, from: span.from, to: span.to };
+    this.queued.push({ field, from: span.from, to: span.to });
     this.maybeFire();
   }
 
   private maybeFire(): void {
-    if (this.isPending || paused || !this.queued) return;
-    const q = this.queued;
-    this.queued = null;
+    if (this.isPending || paused || this.queued.length === 0) return;
+    const q = this.queued.shift()!;
     void this.fire(q);
   }
 
@@ -530,23 +566,48 @@ class Corrector {
         if (this.gen !== g || paused || active !== q.field) return;
         if (!corrected) return;
 
+        const rawCorrected = corrected;
         const final = capitalizeInitial(corrected, capitalize);
+        const noOp = rawCorrected === trimmed;
+
+        if (thinkingMode === "auto" && !thinking) {
+          const res1 = (await browser.runtime.sendMessage({ type: "checkSuspects", text: trimmed })) as Response;
+          const suspects = res1.type === "checkSuspectsResult" ? res1.suspects : false;
+          const res2 = (!noOp) ? ((await browser.runtime.sendMessage({ type: "checkSuspects", text: rawCorrected })) as Response) : null;
+          const leftover = res2?.type === "checkSuspectsResult" ? res2.suspects : false;
+          if (noOp ? suspects : leftover) {
+            continue; // escalate to thinking on original text
+          }
+        }
+        
+        if (noOp && final === trimmed) return; // no change at all
+
         if (final !== trimmed) {
           // The user edited the unit while we waited — never insert stale text.
           if (q.field.readText().slice(q.from, q.to).trim() !== trimmed) return;
           const hunks = diffWords(trimmed, final);
-          if (hunks.length > 0) applyHunks(q.field, q.from, lead, trimmed, hunks);
+          if (hunks.length > 0) {
+            const changes = applyHunks(q.field, q.from, lead, trimmed, hunks);
+            for (const pending of this.queued) {
+              if (pending.field === q.field) {
+                pending.from = mapCaret(pending.from, changes);
+                pending.to = mapCaret(pending.to, changes);
+              }
+            }
+          }
           return;
         }
-        // Flat no-op in "auto" → escalate once (next iteration). Otherwise done.
-        if (thinkingMode !== "auto" || attempt > 0) return;
-        if (q.field.readText().slice(q.from, q.to).trim() !== trimmed) return; // edited → abandon
+        return;
       }
     } finally {
-      hideProcessingPill();
-      this.isPending = false;
-      this.queued = null;
-      this.maybeFire();
+      // Only the current generation resets shared state — a stale fire that
+      // resolves after a newer one started (halt/field-switch/pause) must not
+      // clobber it; reset() already handled that teardown.
+      if (this.gen === g) {
+        hideProcessingPill();
+        this.isPending = false;
+        this.maybeFire();
+      }
     }
   }
 
@@ -692,49 +753,63 @@ function hasAppliedOverlap(field: Field, from: number, to: number): boolean {
   return !!list && list.some((r) => r.from < to && r.to > from);
 }
 
-function applyHunks(field: Field, spanStart: number, lead: number, trimmed: string, hunks: DiffHunk[]): void {
-  const base = spanStart + lead;
-  if (field.kind === "textarea") {
-    const text = field.readText();
-    const changes = hunks.map((h) => ({ from: base + h.from, to: base + h.to, ins: h.replacement }));
-    const caretBefore = field.caret();
-    let v = text;
-    for (const c of [...changes].sort((a, b) => b.from - a.from)) {
-      v = v.slice(0, c.from) + c.ins + v.slice(c.to);
-    }
-    field.setValue(v);
-    field.setCaret(mapCaret(caretBefore, changes));
-    showCorrectionPill(field, base, trimmed, hunks);
-    return;
-  }
+export let isApplying = false;
 
-  // Contenteditable: apply descending so earlier offsets stay valid.
-  const text = field.readText();
-  const changes: { from: number; to: number; ins: string }[] = [];
-  const caretBefore = field.caret();
-  for (const h of [...hunks].sort((a, b) => b.from - a.from)) {
-    const from = base + h.from;
-    const to = base + h.to;
-    const ins = h.replacement;
-    const original = text.slice(from, to);
-    const snippet = contextSnippet(text, from, to, original, ins);
-    field.replace(from, to, ins);
-    changes.push({ from, to, ins });
-    // execCommand merges inserted text into its containing text node, so locate
-    // the exact [from, from+ins.length) range and wrap ONLY that.
-    if (ins !== "") {
-      const span = wrapRange(field.el, from, from + ins.length, "ft-correction");
-      if (span) {
-        span.title = "FastTyper correction";
-        addTooltip(span);
-        decos.push({ span, original, replacement: ins, snippet });
-        span.addEventListener("click", () => revertDeco(decoOf(span)));
+function applyHunks(field: Field, spanStart: number, lead: number, trimmed: string, hunks: DiffHunk[]): { from: number; to: number; ins: string }[] {
+  isApplying = true;
+  try {
+    const base = spanStart + lead;
+    if (field.kind === "textarea") {
+      const text = field.readText();
+      const changes = hunks.map((h) => ({ from: base + h.from, to: base + h.to, ins: h.replacement }));
+      const caretBefore = field.caret();
+      let v = "";
+      let last = 0;
+      const sortedChanges = [...changes].sort((a, b) => a.from - b.from);
+      for (const c of sortedChanges) {
+        v += text.slice(last, c.from) + c.ins;
+        last = c.to;
+      }
+      v += text.slice(last);
+      field.setValue(v);
+      field.setCaret(mapCaret(caretBefore, changes));
+      showCorrectionPill(field, base, trimmed, hunks);
+      return changes;
+    }
+
+    // Contenteditable: apply descending so earlier offsets stay valid.
+    const text = field.readText();
+    const changes: { from: number; to: number; ins: string }[] = [];
+    const caretBefore = field.caret();
+    for (const h of [...hunks].sort((a, b) => b.from - a.from)) {
+      const from = base + h.from;
+      const to = base + h.to;
+      const ins = h.replacement;
+      const original = text.slice(from, to);
+      const snippet = contextSnippet(text, from, to, original, ins);
+      field.replace(from, to, ins);
+      changes.push({ from, to, ins });
+      field.invalidate();
+      // execCommand merges inserted text into its containing text node, so locate
+      // the exact [from, from+ins.length) range and wrap ONLY that.
+      if (ins !== "") {
+        const span = wrapRange(field.el, from, from + ins.length, "ft-correction");
+        if (span) {
+          span.title = "FastTyper correction";
+          addTooltip(span);
+          decos.push({ span, original, replacement: ins, snippet });
+          span.addEventListener("click", () => revertDeco(decoOf(span)));
+        }
+        field.invalidate();
       }
     }
+    // execCommand leaves the caret at the last inserted text; put it back where
+    // the user was, mapped through the edits.
+    field.setCaret(mapCaret(caretBefore, changes));
+    return changes;
+  } finally {
+    isApplying = false;
   }
-  // execCommand leaves the caret at the last inserted text; put it back where
-  // the user was, mapped through the edits.
-  field.setCaret(mapCaret(caretBefore, changes));
 }
 
 function decoOf(span: HTMLElement): Deco | null {
@@ -966,9 +1041,15 @@ function addTooltip(span: HTMLElement): void {
 const corrector = new Corrector();
 let active: Field | null = null;
 
+function isEventForActive(current: Field | null, target: HTMLElement): boolean {
+  if (!current) return false;
+  return current.el === target || current.el.contains(target);
+}
+
 function onFocusIn(el: HTMLElement): void {
   if (!isEditableElement(el)) return; // buttons/links etc. — leave active field alone
-  const f = makeField(el);
+  const root = el.isContentEditable ? contenteditableRoot(el) : el;
+  const f = makeField(root);
   if (!f) {
     corrector.reset();
     active = null;
@@ -978,53 +1059,32 @@ function onFocusIn(el: HTMLElement): void {
   active = f;
 }
 
-// beforeinput snapshot: distinguishes a fresh trigger insertion from an old one.
-let pendingInsert: { caretBefore: number; data: string; lineBreak: boolean } | null = null;
-
-document.addEventListener("beforeinput", (e) => {
-  if (siteDisabled) return;
-  const ie = e as InputEvent;
-  if (!e.isTrusted || ie.isComposing) return;
-  const target = e.target as HTMLElement;
-  if (!isEditableElement(target)) { pendingInsert = null; return; }
-  if (!active || active.el !== target) { pendingInsert = null; return; }
-  const t = ie.inputType;
-  if (t === "insertText" || t === "insertLineBreak" || t === "insertParagraph") {
-    pendingInsert = {
-      caretBefore: active.caret(),
-      data: ie.data ?? "",
-      lineBreak: t !== "insertText",
-    };
-  } else {
-    pendingInsert = null;
-  }
-}, true);
-
 document.addEventListener("input", (e) => {
-  if (siteDisabled) return;
+  if (siteDisabled || isApplying) return;
   const ie = e as InputEvent;
-  if (!e.isTrusted || ie.isComposing) return;
+  // Allow untrusted events because React/Lexical/ProseMirror/Gemini synthesize them.
+  if (ie.isComposing) return;
+  
   const target = e.target as HTMLElement;
-  if (!isEditableElement(target)) { pendingInsert = null; return; }
-  if (!active || active.el !== target) onFocusIn(target);
-  if (!active || active.el !== target) { pendingInsert = null; return; }
+  if (!isEditableElement(target)) return;
+  if (!isEventForActive(active, target)) onFocusIn(target);
+  if (!isEventForActive(active, target)) return;
 
-  const p = pendingInsert;
-  pendingInsert = null;
-  if (!p) return;
+  const t = ie.inputType;
+  // If it's a deletion or formatting event, ignore.
+  // Allow undefined inputType because synthetic events sometimes lack it.
+  if (t && !t.startsWith("insert")) return;
 
-  const field = active;
+  const field = active!;
   const text = field.readText();
   const pos = field.caret() - 1;
-  if (pos < 0) return;
+  if (pos < 0 || pos >= text.length) return;
+  
   const ch = text[pos];
   if (ch !== "." && ch !== "?" && ch !== "!" && ch !== "\n") return;
-
-  const fresh =
-    p.lineBreak
-      ? pos >= p.caretBefore && pos <= p.caretBefore + 2
-      : pos === p.caretBefore + p.data.length - 1;
-  if (!fresh) return;
+  
+  // If it's a known insert text event, double-check the data matches the char at the caret.
+  if (ie.data && !ie.data.endsWith(ch)) return;
 
   corrector.verify(field, pos, ch);
 }, true);

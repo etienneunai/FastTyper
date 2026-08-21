@@ -621,16 +621,25 @@ var grammarCheckerPlugin = import_view.ViewPlugin.fromClass(class {
       return;
     if (span.to - span.from > MAX_UNIT_CHARS)
       return;
-    if (doc.sliceString(span.from, span.to).trim().length < MIN_UNIT_CHARS)
+    const unitText = doc.sliceString(span.from, span.to);
+    if (unitText.trim().length < MIN_UNIT_CHARS)
       return;
     if (this.containsCode(span.from, span.to))
       return;
     if (this.containsMath(span.from, span.to))
       return;
+    if (unitText.split("\n").some((l) => this.isHeadingLine(l)))
+      return;
     this.queue.push(span);
     this.maybeFire();
   }
-  /** Expand `head` to the surrounding paragraph block (blank-line delimited). */
+  /**
+   * Expand `head` to the surrounding paragraph block (blank-line or heading
+   * delimited). A `# heading` line must end the block in both directions: the
+   * model strips heading lines from its output, so pulling one into a unit lets
+   * the diff commit its deletion. (The user's notes were losing `# Overview`
+   * lines this way.)
+   */
   paragraphRange(head) {
     const doc = this.view.state.doc;
     const line = doc.lineAt(head);
@@ -638,13 +647,13 @@ var grammarCheckerPlugin = import_view.ViewPlugin.fromClass(class {
     let to = line.to;
     while (from > 0) {
       const prev = doc.lineAt(from - 1);
-      if (prev.text.trim().length === 0)
+      if (prev.text.trim().length === 0 || this.isHeadingLine(prev.text))
         break;
       from = prev.from;
     }
     while (to < doc.length) {
       const next = doc.lineAt(to + 1);
-      if (next.text.trim().length === 0)
+      if (next.text.trim().length === 0 || this.isHeadingLine(next.text))
         break;
       to = next.to;
     }
@@ -684,6 +693,10 @@ var grammarCheckerPlugin = import_view.ViewPlugin.fromClass(class {
   isListMarkerLine(lineText) {
     const t = lineText.trimStart();
     return /^[-*+]\s/.test(t) || /^\d+[.)]\s/.test(t);
+  }
+  /** True if the line is an ATX Markdown heading (`#`, `##`, … up to 6, ≤3 lead spaces). */
+  isHeadingLine(lineText) {
+    return /^[ ]{0,3}#{1,6}(?:\s|$)/.test(lineText);
   }
   /** The line completed by the newline at `triggerPos`. */
   lineSpan(triggerPos) {
@@ -766,6 +779,8 @@ var grammarCheckerPlugin = import_view.ViewPlugin.fromClass(class {
         if (this.containsCode(this.pending.from, this.pending.to))
           return;
         if (this.containsMath(this.pending.from, this.pending.to))
+          return;
+        if (raw.split("\n").some((l) => this.isHeadingLine(l)))
           return;
         this.pending.text = text;
         this.pending.lead = lead;

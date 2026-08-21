@@ -710,15 +710,28 @@ const grammarCheckerPlugin = ViewPlugin.fromClass(class {
         const span = ch === '\n' ? this.lineSpan(pos) : this.sentenceSpan(pos);
         if (!span) return;
         if (span.to - span.from > MAX_UNIT_CHARS) return;
-        if (doc.sliceString(span.from, span.to).trim().length < MIN_UNIT_CHARS) return;
+        const unitText = doc.sliceString(span.from, span.to);
+        if (unitText.trim().length < MIN_UNIT_CHARS) return;
         if (this.containsCode(span.from, span.to)) return;
         if (this.containsMath(span.from, span.to)) return;
+        // A unit containing a Markdown heading line is never corrected: the model
+        // strips `# heading` lines from its output, and the diff would delete the
+        // heading. Covers the bare `# Overview` newline trigger, a heading whose
+        // own period fires the trigger (`# 3. The design`), and any span that
+        // straddled a heading.
+        if (unitText.split("\n").some(l => this.isHeadingLine(l))) return;
 
         this.queue.push(span);
         this.maybeFire();
     }
 
-    /** Expand `head` to the surrounding paragraph block (blank-line delimited). */
+    /**
+     * Expand `head` to the surrounding paragraph block (blank-line or heading
+     * delimited). A `# heading` line must end the block in both directions: the
+     * model strips heading lines from its output, so pulling one into a unit lets
+     * the diff commit its deletion. (The user's notes were losing `# Overview`
+     * lines this way.)
+     */
     private paragraphRange(head: number): { from: number; to: number } {
         const doc = this.view.state.doc;
         const line = doc.lineAt(head);
@@ -726,12 +739,12 @@ const grammarCheckerPlugin = ViewPlugin.fromClass(class {
         let to = line.to;
         while (from > 0) {
             const prev = doc.lineAt(from - 1);
-            if (prev.text.trim().length === 0) break;
+            if (prev.text.trim().length === 0 || this.isHeadingLine(prev.text)) break;
             from = prev.from;
         }
         while (to < doc.length) {
             const next = doc.lineAt(to + 1);
-            if (next.text.trim().length === 0) break;
+            if (next.text.trim().length === 0 || this.isHeadingLine(next.text)) break;
             to = next.to;
         }
         return { from, to };
@@ -782,6 +795,11 @@ const grammarCheckerPlugin = ViewPlugin.fromClass(class {
     private isListMarkerLine(lineText: string): boolean {
         const t = lineText.trimStart();
         return /^[-*+]\s/.test(t) || /^\d+[.)]\s/.test(t);
+    }
+
+    /** True if the line is an ATX Markdown heading (`#`, `##`, … up to 6, ≤3 lead spaces). */
+    private isHeadingLine(lineText: string): boolean {
+        return /^[ ]{0,3}#{1,6}(?:\s|$)/.test(lineText);
     }
 
     /** The line completed by the newline at `triggerPos`. */
@@ -865,6 +883,10 @@ const grammarCheckerPlugin = ViewPlugin.fromClass(class {
                 if (text.length < MIN_UNIT_CHARS) return;
                 if (this.containsCode(this.pending.from, this.pending.to)) return;
                 if (this.containsMath(this.pending.from, this.pending.to)) return;
+                // Backstop (same guard as confirmTrigger): a heading must never ride
+                // on a re-slice — the user can edit one into the span mid-flight,
+                // and the resend loop reads the doc fresh each attempt.
+                if (raw.split("\n").some(l => this.isHeadingLine(l))) return;
                 this.pending.text = text;
                 this.pending.lead = lead;
 

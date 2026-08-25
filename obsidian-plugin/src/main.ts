@@ -1,5 +1,5 @@
 import { App, MarkdownView, Notice, Plugin, PluginSettingTab, Setting, requestUrl } from 'obsidian';
-import { StateField, StateEffect, Transaction, ChangeSet, type Range, type Text } from '@codemirror/state';
+import { StateField, StateEffect, Transaction, ChangeSet, EditorState, type Range, type Text } from '@codemirror/state';
 import { Decoration, DecorationSet, EditorView, ViewPlugin, ViewUpdate, hoverTooltip, WidgetType } from '@codemirror/view';
 import { syntaxTree } from '@codemirror/language';
 
@@ -432,6 +432,65 @@ function restoreLinks(corrected: string, links: LinkSpan[]): string {
     return out;
 }
 
+const MATH_MASK = '█'; // U+2588 Full Block
+
+interface MathSpan { from: number; to: number; inner: string; }
+
+function getMathSpans(text: string, offset: number, state: EditorState): MathSpan[] {
+    const spans: MathSpan[] = [];
+    syntaxTree(state).iterate({
+        from: offset,
+        to: offset + text.length,
+        enter: (node) => {
+            const name = node.name.toLowerCase();
+            if (name.includes("math") || name === "equation") {
+                const start = Math.max(0, node.from - offset);
+                const end = Math.min(text.length, node.to - offset);
+                if (end > start) {
+                    spans.push({ from: start, to: end, inner: text.slice(start, end) });
+                }
+            }
+        }
+    });
+
+    const filtered: MathSpan[] = [];
+    for (const sp of spans) {
+        if (!filtered.some(f => sp.from >= f.from && sp.to <= f.to)) {
+            filtered.push(sp);
+        }
+    }
+    filtered.sort((a, b) => a.from - b.from);
+    return filtered;
+}
+
+function maskMath(text: string, spans: MathSpan[]): string {
+    if (spans.length === 0) return text;
+    let out = "";
+    let last = 0;
+    for (const sp of spans) {
+        out += text.slice(last, sp.from);
+        out += MATH_MASK.repeat(sp.inner.length);
+        last = sp.to;
+    }
+    out += text.slice(last);
+    return out;
+}
+
+function mathIntact(corrected: string, spans: MathSpan[]): boolean {
+    for (const sp of spans) {
+        if (!corrected.includes(MATH_MASK.repeat(sp.inner.length))) return false;
+    }
+    return true;
+}
+
+function restoreMath(corrected: string, spans: MathSpan[]): string {
+    let out = corrected;
+    for (const sp of spans) {
+        out = out.replace(MATH_MASK.repeat(sp.inner.length), sp.inner);
+    }
+    return out;
+}
+
 const MAX_CHAR_DIFF_CELLS = 4_000_000;
 const diffBuffer = new Int32Array(MAX_CHAR_DIFF_CELLS + 2000);
 
@@ -713,7 +772,10 @@ const grammarCheckerPlugin = ViewPlugin.fromClass(class {
         const unitText = doc.sliceString(span.from, span.to);
         if (unitText.trim().length < MIN_UNIT_CHARS) return;
         if (this.containsCode(span.from, span.to)) return;
-        if (this.containsMath(span.from, span.to)) return;
+        const mathSpans = getMathSpans(unitText, span.from, this.view.state);
+        if (unitText.includes(MATH_MASK)) return;
+        const textWithoutMath = maskMath(unitText, mathSpans).replace(new RegExp(MATH_MASK, 'g'), '');
+        if (!/[a-zA-Z]/.test(textWithoutMath)) return;
         // A unit containing a Markdown heading line is never corrected: the model
         // strips `# heading` lines from its output, and the diff would delete the
         // heading. Covers the bare `# Overview` newline trigger, a heading whose
@@ -839,21 +901,7 @@ const grammarCheckerPlugin = ViewPlugin.fromClass(class {
         return found;
     }
 
-    /** True if the range overlaps math (`$…$` inline or `$$…$$` block). */
-    private containsMath(from: number, to: number): boolean {
-        let found = false;
-        syntaxTree(this.view.state).iterate({
-            from,
-            to,
-            enter: (node) => {
-                if (node.name.includes("Math")) {
-                    found = true;
-                    return false;
-                }
-            }
-        });
-        return found;
-    }
+
 
     /** Map a span forward through a change set (keeps it accurate while the user types). */
     private mapSpan(span: { from: number; to: number }, changes: ChangeSet): { from: number; to: number } {
@@ -882,7 +930,10 @@ const grammarCheckerPlugin = ViewPlugin.fromClass(class {
                 const lead = raw.length - raw.trimStart().length;
                 if (text.length < MIN_UNIT_CHARS) return;
                 if (this.containsCode(this.pending.from, this.pending.to)) return;
-                if (this.containsMath(this.pending.from, this.pending.to)) return;
+                const mathSpans = getMathSpans(text, this.pending.from + lead, this.view.state);
+                if (text.includes(MATH_MASK)) return;
+                const textWithoutMath = maskMath(text, mathSpans).replace(new RegExp(MATH_MASK, 'g'), '');
+                if (!/[a-zA-Z]/.test(textWithoutMath)) return;
                 // Backstop (same guard as confirmTrigger): a heading must never ride
                 // on a re-slice — the user can edit one into the span mid-flight,
                 // and the resend loop reads the doc fresh each attempt.
@@ -895,7 +946,7 @@ const grammarCheckerPlugin = ViewPlugin.fromClass(class {
 
                 let corrected: string | null = null;
                 try {
-                    corrected = await this.request(text, controller.signal, thinking);
+                    corrected = await this.request(text, controller.signal, thinking, mathSpans);
                 } catch (e: any) {
                     if (e?.name !== 'AbortError') {
                         console.error("FastTyper: grammar request failed", e);
@@ -983,18 +1034,19 @@ const grammarCheckerPlugin = ViewPlugin.fromClass(class {
      * matrix proved fixes the hard dyslexic cases (9/10) that flat inference
      * leaves unchanged (6/10), at ~6–12 s instead of ~0.4 s.
      */
-    private async request(text: string, signal: AbortSignal, thinking: boolean): Promise<string | null> {
-        // Mask Obsidian link contents so the model never sees filenames/URLs/tags
-        // (see the link-protection helpers above). The masked string keeps every
-        // non-link character at the same offset; links are restored after the
-        // guards below, so the caller's diff sees the original link text verbatim.
-        const { masked, links } = maskLinks(text);
+    private async request(text: string, signal: AbortSignal, thinking: boolean, mathSpans: MathSpan[]): Promise<string | null> {
+        // Mask Math blocks and Obsidian link contents so the model never sees them
+        // (see the protection helpers above). The masked string keeps every
+        // protected character at the same offset; they are restored after the
+        // guards below, so the caller's diff sees the original text verbatim.
+        let masked = maskMath(text, mathSpans);
+        const { masked: finalMasked, links } = maskLinks(masked);
         const prompt = thinking ? PROMPT_PRESETS.find(p => p.id === "E") ?? PROMPT_PRESETS[0] : activePrompt();
         const payload = {
             model: MODEL,
             messages: [
                 { role: "system", content: prompt.system },
-                { role: "user", content: prompt.user.split("{text}").join(masked) }
+                { role: "user", content: prompt.user.split("{text}").join(finalMasked) }
             ],
             temperature: 0,
             // Thinking needs headroom for the reasoning block; flat stays capped
@@ -1058,8 +1110,10 @@ const grammarCheckerPlugin = ViewPlugin.fromClass(class {
         // still catches the model hallucinating `[[...]]` into link-free prose.
         // Then restore the original inner contents (the model only ever saw `·` runs);
         // this is a no-op when neither text nor corrected has links.
-        if (!linksIntact(text, corrected)) return null;
+        if (!linksIntact(masked, corrected)) return null;
         corrected = restoreLinks(corrected, links);
+        if (!mathIntact(corrected, mathSpans)) return null;
+        corrected = restoreMath(corrected, mathSpans);
         if (corrected.length > text.length * 2 + 200) return null;
         return corrected;
     }

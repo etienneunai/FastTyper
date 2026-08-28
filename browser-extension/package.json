@@ -1,6 +1,7 @@
 {
   "name": "fasttyper-browser-extension",
   "version": "0.1.0",
+  "author": "etienneunai",
   "description": "FastTyper Firefox extension: local grammar correction in web text fields.",
   "private": true,
   "type": "module",

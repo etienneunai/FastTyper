@@ -91,7 +91,7 @@ Once enabled you get:
 backend/              Llama.cpp daemon: systemd unit + setup.sh (model download, Vulkan build)
 obsidian-plugin/      CodeMirror 6 Obsidian plugin (src/main.ts is the core)
 browser-extension/    Firefox extension: local grammar correction in web text fields
-CLAUDE.md             Detailed development notes and architecture
+AGENTS.md             Detailed development notes, rules, and architecture for AI agents
 ```
 
 ### Browser extension (universal correction for the web)

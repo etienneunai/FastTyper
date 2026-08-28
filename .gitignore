@@ -1,5 +1,7 @@
 # Build artifacts
 obsidian-plugin/node_modules/
+obsidian-plugin/main.js
+obsidian-plugin/wordlist.json
 browser-extension/node_modules/
 browser-extension/dist/
 

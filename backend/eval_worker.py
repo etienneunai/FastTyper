@@ -1,5 +1,7 @@
 import sys, json, re, urllib.request
 
+error = None
+out = ""
 try:
     if len(sys.argv) < 9:
         raise ValueError("Not enough arguments")

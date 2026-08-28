@@ -22,7 +22,7 @@
  */
 import {
   TRIGGER_VERIFY_MS, MAX_UNIT_CHARS, MIN_UNIT_CHARS, ABBREVIATIONS,
-  diffWords, capitalizeInitial, contextSnippet,
+  diffWords, capitalizeInitial, contextSnippet, maskMarkdown, restoreMarkdown,
   type DiffHunk, type PushMsg, type ThinkingMode, type Response
 } from "./shared";
 
@@ -446,10 +446,6 @@ function sentenceSpan(text: string, blockStart: number, blockEnd: number, trigge
   return { from, to };
 }
 
-/** Skip units that look like markdown fenced code or indented code. */
-function looksLikeCode(text: string): boolean {
-  return /```/.test(text) || /(^|\n) {4}/.test(text) || /(^|\n)\t/.test(text);
-}
 
 // ---------------------------------------------------------------------------
 // Corrector pipeline (ported from main.ts Corrector + fire())
@@ -526,7 +522,8 @@ class Corrector {
     if (span.to - span.from > MAX_UNIT_CHARS) return;
     const unit = text.slice(span.from, span.to);
     if (unit.trim().length < MIN_UNIT_CHARS) return;
-    if (looksLikeCode(unit)) return;
+    const { masked } = maskMarkdown(unit);
+    if (!/[a-zA-Z]/.test(masked.replace(/█/g, ''))) return;
 
     // If the unit overlaps an already-applied (still-active) correction, the
     // user is editing the corrected text — don't substitute over it again.
@@ -553,7 +550,8 @@ class Corrector {
       const trimmed = raw.trim();
       const lead = raw.length - raw.trimStart().length;
       if (trimmed.length < MIN_UNIT_CHARS) return;
-      if (looksLikeCode(trimmed)) return;
+      const { masked, maskChars } = maskMarkdown(trimmed);
+      if (!/[a-zA-Z]/.test(masked.replace(/█/g, ''))) return;
 
       // "auto" tries flat once, then escalates to E + thinking ONLY if flat
       // changed nothing. A thinking no-op is final (thinking is non-deterministic
@@ -562,8 +560,10 @@ class Corrector {
       for (let attempt = 0; attempt < maxAttempts; attempt++) {
         const thinking = thinkingMode === "always" || attempt === 1;
         if (thinking) updateProcessingPill(q.field, true);
-        const corrected = await this.request(trimmed, thinking);
+        const correctedMasked = await this.request(masked, thinking);
         if (this.gen !== g || paused || active !== q.field) return;
+        if (!correctedMasked) return;
+        const corrected = restoreMarkdown(correctedMasked, maskChars);
         if (!corrected) return;
 
         const rawCorrected = corrected;

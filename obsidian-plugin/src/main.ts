@@ -305,6 +305,30 @@ export const grammarTooltip = hoverTooltip((view, pos, side) => {
 // ---------------------------------------------------------------------------
 
 /** Strip Qwen3 `<think>` blocks (and any unclosed tail) and tidy the reply. */
+
+const MARKDOWN_REGEX = /```[\s\S]*?```|`[^`\n]+`|\$\$[\s\S]*?\$\$|\$[^$\n]+\$|^---\n[\s\S]*?\n---|!\[\[.*?\]\]|\[\[.*?\]\]|\]\(.*?\)|^[ \t]*#{1,6}\s|^[ \t]*>\s|^[ \t]*[-*+]\s|^[ \t]*\d+\.\s|\*\*|__|==|~~|\*|_|\[|\]/gm;
+
+function maskMarkdown(text: string): { masked: string, maskStrings: string[] } {
+    const maskStrings: string[] = [];
+    const masked = text.replace(MARKDOWN_REGEX, (match) => {
+        const id = maskStrings.length;
+        maskStrings.push(match);
+        return `<M${id}/>`;
+    });
+    return { masked, maskStrings };
+}
+
+function restoreMarkdown(corrected: string, maskStrings: string[]): string | null {
+    let out = corrected;
+    for (let i = 0; i < maskStrings.length; i++) {
+        const tag = `<M${i}/>`;
+        if (!out.includes(tag)) return null;
+        out = out.replace(tag, maskStrings[i]);
+    }
+    if (/<M\d+\/>/.test(out)) return null;
+    return out;
+}
+
 function parseResponse(content: string): string | null {
     let s = content.replace(/<think[\s\S]*?<\/think>/g, "");
     const openIdx = s.indexOf("<think");
@@ -771,17 +795,8 @@ const grammarCheckerPlugin = ViewPlugin.fromClass(class {
         if (span.to - span.from > MAX_UNIT_CHARS) return;
         const unitText = doc.sliceString(span.from, span.to);
         if (unitText.trim().length < MIN_UNIT_CHARS) return;
-        if (this.containsCode(span.from, span.to)) return;
-        const mathSpans = getMathSpans(unitText, span.from, this.view.state);
-        if (unitText.includes(MATH_MASK)) return;
-        const textWithoutMath = maskMath(unitText, mathSpans).replace(new RegExp(MATH_MASK, 'g'), '');
-        if (!/[a-zA-Z]/.test(textWithoutMath)) return;
-        // A unit containing a Markdown heading line is never corrected: the model
-        // strips `# heading` lines from its output, and the diff would delete the
-        // heading. Covers the bare `# Overview` newline trigger, a heading whose
-        // own period fires the trigger (`# 3. The design`), and any span that
-        // straddled a heading.
-        if (unitText.split("\n").some(l => this.isHeadingLine(l))) return;
+        const { masked } = maskMarkdown(unitText);
+        if (!/[a-zA-Z]/.test(masked.replace(/<M\d+\/>/g, ''))) return;
 
         this.queue.push(span);
         this.maybeFire();
@@ -885,21 +900,7 @@ const grammarCheckerPlugin = ViewPlugin.fromClass(class {
         return doc.sliceString(start, pos + 1);
     }
 
-    /** True if the range overlaps inline/fenced code or frontmatter. */
-    private containsCode(from: number, to: number): boolean {
-        let found = false;
-        syntaxTree(this.view.state).iterate({
-            from,
-            to,
-            enter: (node) => {
-                if (node.name.includes("Code") || node.name === "Frontmatter") {
-                    found = true;
-                    return false;
-                }
-            }
-        });
-        return found;
-    }
+    
 
 
 
@@ -929,24 +930,25 @@ const grammarCheckerPlugin = ViewPlugin.fromClass(class {
                 const text = raw.trim();
                 const lead = raw.length - raw.trimStart().length;
                 if (text.length < MIN_UNIT_CHARS) return;
-                if (this.containsCode(this.pending.from, this.pending.to)) return;
-                const mathSpans = getMathSpans(text, this.pending.from + lead, this.view.state);
-                if (text.includes(MATH_MASK)) return;
-                const textWithoutMath = maskMath(text, mathSpans).replace(new RegExp(MATH_MASK, 'g'), '');
-                if (!/[a-zA-Z]/.test(textWithoutMath)) return;
-                // Backstop (same guard as confirmTrigger): a heading must never ride
-                // on a re-slice — the user can edit one into the span mid-flight,
-                // and the resend loop reads the doc fresh each attempt.
-                if (raw.split("\n").some(l => this.isHeadingLine(l))) return;
+                
+                let leadingPrefix = '';
+                const prefixMatch = text.match(/^([ \t]*>[ \t]+|[ \t]*[-*+][ \t]+|[ \t]*\d+\.[ \t]+|[ \t]*#{1,6}[ \t]+)/);
+                if (prefixMatch) {
+                    leadingPrefix = prefixMatch[1];
+                }
+                const payloadText = text.slice(leadingPrefix.length);
+
+                const { masked, maskStrings } = maskMarkdown(payloadText);
+                if (!/[a-zA-Z]/.test(masked.replace(/<M\d+\/>/g, ''))) return;
                 this.pending.text = text;
                 this.pending.lead = lead;
 
                 const controller = new AbortController();
                 this.abortController = controller;
 
-                let corrected: string | null = null;
+                let correctedMasked: string | null = null;
                 try {
-                    corrected = await this.request(text, controller.signal, thinking, mathSpans);
+                    correctedMasked = await this.request(payloadText, masked, controller.signal, thinking);
                 } catch (e: any) {
                     if (e?.name !== 'AbortError') {
                         console.error("FastTyper: grammar request failed", e);
@@ -956,22 +958,22 @@ const grammarCheckerPlugin = ViewPlugin.fromClass(class {
                 if (this.destroyed || this.paused || this.fireSeq !== mySeq || this.abortController !== controller) return;
                 this.abortController = null;
 
-                if (!corrected) return; // nothing usable from the model
+                if (!correctedMasked) return; // nothing usable from the model
+                const rawRestored = restoreMarkdown(correctedMasked, maskStrings);
+                if (!rawRestored) return;
+                
+                let corrected = leadingPrefix + rawRestored;
+                if (corrected.length > text.length * 2 + 200) return;
+
                 const rawCorrected = corrected;           // model output, pre-capitalize
                 corrected = this.capitalizeInitial(rawCorrected);
-                // Compare the RAW output (pre-capitalize): `corrected === text` used
-                // to run after capitalizeInitial, which masked a lowercase-initial
-                // no-op so Auto never escalated on those sentences.
                 const noOp = rawCorrected === text;
-                // Escalate once to E+thinking when the flat pass looks incomplete: a
-                // no-op with typos still in the text, or a partial fix that left
-                // non-dictionary tokens. A clean no-op is left alone — only the
-                // deterministic capitalization is applied, no slow thinking pass.
-                // (No flat fallback: if thinking can't fix it, leave the unit as-is
-                // rather than half-fixing it — a clear failure beats a silent miss.)
+
                 if (thinkingMode === "auto" && !thinking) {
-                    const suspects = hasSuspectTokens(text);                 // typos flat didn't touch
-                    const leftover = !noOp && hasSuspectTokens(corrected);   // fixed some, left some
+                    const plainOriginal = masked.replace(/<M\d+\/>/g, ' ');
+                    const plainCorrected = correctedMasked.replace(/<M\d+\/>/g, ' ');
+                    const suspects = hasSuspectTokens(plainOriginal);
+                    const leftover = !noOp && hasSuspectTokens(plainCorrected);
                     if (noOp ? suspects : leftover) {
                         thinking = true;
                         this.markProcessing(true);
@@ -1034,19 +1036,13 @@ const grammarCheckerPlugin = ViewPlugin.fromClass(class {
      * matrix proved fixes the hard dyslexic cases (9/10) that flat inference
      * leaves unchanged (6/10), at ~6–12 s instead of ~0.4 s.
      */
-    private async request(text: string, signal: AbortSignal, thinking: boolean, mathSpans: MathSpan[]): Promise<string | null> {
-        // Mask Math blocks and Obsidian link contents so the model never sees them
-        // (see the protection helpers above). The masked string keeps every
-        // protected character at the same offset; they are restored after the
-        // guards below, so the caller's diff sees the original text verbatim.
-        let masked = maskMath(text, mathSpans);
-        const { masked: finalMasked, links } = maskLinks(masked);
+    private async request(text: string, masked: string, signal: AbortSignal, thinking: boolean): Promise<string | null> {
         const prompt = thinking ? PROMPT_PRESETS.find(p => p.id === "E") ?? PROMPT_PRESETS[0] : activePrompt();
         const payload = {
             model: MODEL,
             messages: [
                 { role: "system", content: prompt.system },
-                { role: "user", content: prompt.user.split("{text}").join(finalMasked) }
+                { role: "user", content: prompt.user.split("{text}").join(masked) }
             ],
             temperature: 0,
             // Thinking needs headroom for the reasoning block; flat stays capped
@@ -1095,26 +1091,8 @@ const grammarCheckerPlugin = ViewPlugin.fromClass(class {
         if (!corrected) return null;
         // Echo guards: (1) the model must not repeat the instruction back (the v4
         // proof prompt can echo on short/hard inputs — catastrophic, would replace
-        // the text with the prompt); (2) it must not balloon the input 2x+200 chars;
-        // (3) it must not add, remove, or reposition emphasis/strong/strikethrough
-        // markers (`*`, `_`, `~`) — word fixes inside `**bold**` are fine (the runs
-        // survive), but "tidying" `**x**` → `x` is rejected.
+        // the text with the prompt);
         if (isInstructionEcho(corrected)) return null;
-        // Compare emphasis signatures in MASKED space: the mask hides any `*`/`_`/`~`
-        // inside link contents (e.g. `[[my_note]]`), which the model must never see.
-        if (markdownSignature(masked) !== markdownSignature(corrected)) return null;
-        // Link integrity: the model must have left every link structurally intact
-        // (same bracket count, same inner length, same closed/unclosed state) — any
-        // added/removed/repositioned link means it tried to "fix" one, so the whole
-        // correction is rejected. Runs unconditionally: when `text` had no links it
-        // still catches the model hallucinating `[[...]]` into link-free prose.
-        // Then restore the original inner contents (the model only ever saw `·` runs);
-        // this is a no-op when neither text nor corrected has links.
-        if (!linksIntact(masked, corrected)) return null;
-        corrected = restoreLinks(corrected, links);
-        if (!mathIntact(corrected, mathSpans)) return null;
-        corrected = restoreMath(corrected, mathSpans);
-        if (corrected.length > text.length * 2 + 200) return null;
         return corrected;
     }
 

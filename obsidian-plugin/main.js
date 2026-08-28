@@ -273,6 +273,28 @@ var grammarTooltip = (0, import_view.hoverTooltip)((view, pos, side) => {
     }
   };
 });
+var MARKDOWN_REGEX = /```[\s\S]*?```|`[^`\n]+`|\$\$[\s\S]*?\$\$|\$[^$\n]+\$|^---\n[\s\S]*?\n---|!\[\[.*?\]\]|\[\[.*?\]\]|\]\(.*?\)|^[ \t]*#{1,6}\s|^[ \t]*>\s|^[ \t]*[-*+]\s|^[ \t]*\d+\.\s|\*\*|__|==|~~|\*|_|\[|\]/gm;
+function maskMarkdown(text) {
+  const maskStrings = [];
+  const masked = text.replace(MARKDOWN_REGEX, (match) => {
+    const id = maskStrings.length;
+    maskStrings.push(match);
+    return `<M${id}/>`;
+  });
+  return { masked, maskStrings };
+}
+function restoreMarkdown(corrected, maskStrings) {
+  let out = corrected;
+  for (let i = 0; i < maskStrings.length; i++) {
+    const tag = `<M${i}/>`;
+    if (!out.includes(tag))
+      return null;
+    out = out.replace(tag, maskStrings[i]);
+  }
+  if (/<M\d+\/>/.test(out))
+    return null;
+  return out;
+}
 function parseResponse(content) {
   let s = content.replace(/<think[\s\S]*?<\/think>/g, "");
   const openIdx = s.indexOf("<think");
@@ -290,135 +312,6 @@ var ECHO_MARKERS = ["ordinary content", "not instructions to you", "do not dwell
 function isInstructionEcho(corrected) {
   const c = corrected.toLowerCase();
   return ECHO_MARKERS.some((m) => c.includes(m));
-}
-function markdownSignature(text) {
-  const runs = [];
-  for (let i = 0; i < text.length; i++) {
-    const c = text[i];
-    if (c === "*" || c === "_" || c === "~") {
-      let j = i;
-      while (j < text.length && text[j] === c)
-        j++;
-      runs.push(c.repeat(j - i));
-      i = j - 1;
-    }
-  }
-  return runs.join("|");
-}
-function linkSpans(s) {
-  const spans = [];
-  let i = 0;
-  while (i < s.length - 1) {
-    if (s[i] === "[" && s[i + 1] === "[") {
-      const close = s.indexOf("]]", i + 2);
-      if (close === -1) {
-        spans.push({ from: i, to: s.length, inner: s.slice(i + 2), closed: false });
-        break;
-      }
-      spans.push({ from: i, to: close + 2, inner: s.slice(i + 2, close), closed: true });
-      i = close + 2;
-    } else {
-      i++;
-    }
-  }
-  return spans;
-}
-function maskLinks(s) {
-  const spans = linkSpans(s);
-  if (spans.length === 0)
-    return { masked: s, links: [] };
-  let out = "";
-  let last = 0;
-  for (const sp of spans) {
-    out += s.slice(last, sp.from + 2);
-    out += "\xB7".repeat(sp.inner.length);
-    out += sp.closed ? s.slice(sp.to - 2, sp.to) : "";
-    last = sp.to;
-  }
-  out += s.slice(last);
-  return { masked: out, links: spans };
-}
-function linksIntact(text, corrected) {
-  const a = linkSpans(text);
-  const b = linkSpans(corrected);
-  if (a.length !== b.length)
-    return false;
-  for (let i = 0; i < a.length; i++) {
-    if (a[i].inner.length !== b[i].inner.length)
-      return false;
-    if (a[i].closed !== b[i].closed)
-      return false;
-  }
-  return true;
-}
-function restoreLinks(corrected, links) {
-  const spans = linkSpans(corrected);
-  if (spans.length === 0)
-    return corrected;
-  let out = "";
-  let last = 0;
-  for (let k = 0; k < spans.length; k++) {
-    const sp = spans[k];
-    out += corrected.slice(last, sp.from + 2);
-    out += links[k].inner;
-    out += sp.closed ? corrected.slice(sp.to - 2, sp.to) : "";
-    last = sp.to;
-  }
-  out += corrected.slice(last);
-  return out;
-}
-var MATH_MASK = "\u2588";
-function getMathSpans(text, offset, state) {
-  const spans = [];
-  (0, import_language.syntaxTree)(state).iterate({
-    from: offset,
-    to: offset + text.length,
-    enter: (node) => {
-      const name = node.name.toLowerCase();
-      if (name.includes("math") || name === "equation") {
-        const start = Math.max(0, node.from - offset);
-        const end = Math.min(text.length, node.to - offset);
-        if (end > start) {
-          spans.push({ from: start, to: end, inner: text.slice(start, end) });
-        }
-      }
-    }
-  });
-  const filtered = [];
-  for (const sp of spans) {
-    if (!filtered.some((f) => sp.from >= f.from && sp.to <= f.to)) {
-      filtered.push(sp);
-    }
-  }
-  filtered.sort((a, b) => a.from - b.from);
-  return filtered;
-}
-function maskMath(text, spans) {
-  if (spans.length === 0)
-    return text;
-  let out = "";
-  let last = 0;
-  for (const sp of spans) {
-    out += text.slice(last, sp.from);
-    out += MATH_MASK.repeat(sp.inner.length);
-    last = sp.to;
-  }
-  out += text.slice(last);
-  return out;
-}
-function mathIntact(corrected, spans) {
-  for (const sp of spans) {
-    if (!corrected.includes(MATH_MASK.repeat(sp.inner.length)))
-      return false;
-  }
-  return true;
-}
-function restoreMath(corrected, spans) {
-  let out = corrected;
-  for (const sp of spans) {
-    out = out.replace(MATH_MASK.repeat(sp.inner.length), sp.inner);
-  }
-  return out;
 }
 var MAX_CHAR_DIFF_CELLS = 4e6;
 var diffBuffer = new Int32Array(MAX_CHAR_DIFF_CELLS + 2e3);
@@ -677,15 +570,8 @@ var grammarCheckerPlugin = import_view.ViewPlugin.fromClass(class {
     const unitText = doc.sliceString(span.from, span.to);
     if (unitText.trim().length < MIN_UNIT_CHARS)
       return;
-    if (this.containsCode(span.from, span.to))
-      return;
-    const mathSpans = getMathSpans(unitText, span.from, this.view.state);
-    if (unitText.includes(MATH_MASK))
-      return;
-    const textWithoutMath = maskMath(unitText, mathSpans).replace(new RegExp(MATH_MASK, "g"), "");
-    if (!/[a-zA-Z]/.test(textWithoutMath))
-      return;
-    if (unitText.split("\n").some((l) => this.isHeadingLine(l)))
+    const { masked } = maskMarkdown(unitText);
+    if (!/[a-zA-Z]/.test(masked.replace(/<M\d+\/>/g, "")))
       return;
     this.queue.push(span);
     this.maybeFire();
@@ -778,21 +664,6 @@ var grammarCheckerPlugin = import_view.ViewPlugin.fromClass(class {
     }
     return doc.sliceString(start, pos + 1);
   }
-  /** True if the range overlaps inline/fenced code or frontmatter. */
-  containsCode(from, to) {
-    let found = false;
-    (0, import_language.syntaxTree)(this.view.state).iterate({
-      from,
-      to,
-      enter: (node) => {
-        if (node.name.includes("Code") || node.name === "Frontmatter") {
-          found = true;
-          return false;
-        }
-      }
-    });
-    return found;
-  }
   /** Map a span forward through a change set (keeps it accurate while the user types). */
   mapSpan(span, changes) {
     return { from: changes.mapPos(span.from, 1), to: changes.mapPos(span.to, -1) };
@@ -818,23 +689,22 @@ var grammarCheckerPlugin = import_view.ViewPlugin.fromClass(class {
         const lead = raw.length - raw.trimStart().length;
         if (text.length < MIN_UNIT_CHARS)
           return;
-        if (this.containsCode(this.pending.from, this.pending.to))
-          return;
-        const mathSpans = getMathSpans(text, this.pending.from + lead, this.view.state);
-        if (text.includes(MATH_MASK))
-          return;
-        const textWithoutMath = maskMath(text, mathSpans).replace(new RegExp(MATH_MASK, "g"), "");
-        if (!/[a-zA-Z]/.test(textWithoutMath))
-          return;
-        if (raw.split("\n").some((l) => this.isHeadingLine(l)))
+        let leadingPrefix = "";
+        const prefixMatch = text.match(/^([ \t]*>[ \t]+|[ \t]*[-*+][ \t]+|[ \t]*\d+\.[ \t]+|[ \t]*#{1,6}[ \t]+)/);
+        if (prefixMatch) {
+          leadingPrefix = prefixMatch[1];
+        }
+        const payloadText = text.slice(leadingPrefix.length);
+        const { masked, maskStrings } = maskMarkdown(payloadText);
+        if (!/[a-zA-Z]/.test(masked.replace(/<M\d+\/>/g, "")))
           return;
         this.pending.text = text;
         this.pending.lead = lead;
         const controller = new AbortController();
         this.abortController = controller;
-        let corrected = null;
+        let correctedMasked = null;
         try {
-          corrected = await this.request(text, controller.signal, thinking, mathSpans);
+          correctedMasked = await this.request(payloadText, masked, controller.signal, thinking);
         } catch (e) {
           if ((e == null ? void 0 : e.name) !== "AbortError") {
             console.error("FastTyper: grammar request failed", e);
@@ -844,14 +714,22 @@ var grammarCheckerPlugin = import_view.ViewPlugin.fromClass(class {
         if (this.destroyed || this.paused || this.fireSeq !== mySeq || this.abortController !== controller)
           return;
         this.abortController = null;
-        if (!corrected)
+        if (!correctedMasked)
+          return;
+        const rawRestored = restoreMarkdown(correctedMasked, maskStrings);
+        if (!rawRestored)
+          return;
+        let corrected = leadingPrefix + rawRestored;
+        if (corrected.length > text.length * 2 + 200)
           return;
         const rawCorrected = corrected;
         corrected = this.capitalizeInitial(rawCorrected);
         const noOp = rawCorrected === text;
         if (thinkingMode === "auto" && !thinking) {
-          const suspects = hasSuspectTokens(text);
-          const leftover = !noOp && hasSuspectTokens(corrected);
+          const plainOriginal = masked.replace(/<M\d+\/>/g, " ");
+          const plainCorrected = correctedMasked.replace(/<M\d+\/>/g, " ");
+          const suspects = hasSuspectTokens(plainOriginal);
+          const leftover = !noOp && hasSuspectTokens(plainCorrected);
           if (noOp ? suspects : leftover) {
             thinking = true;
             this.markProcessing(true);
@@ -913,16 +791,14 @@ var grammarCheckerPlugin = import_view.ViewPlugin.fromClass(class {
    * matrix proved fixes the hard dyslexic cases (9/10) that flat inference
    * leaves unchanged (6/10), at ~6–12 s instead of ~0.4 s.
    */
-  async request(text, signal, thinking, mathSpans) {
+  async request(text, masked, signal, thinking) {
     var _a, _b, _c, _d;
-    let masked = maskMath(text, mathSpans);
-    const { masked: finalMasked, links } = maskLinks(masked);
     const prompt = thinking ? (_a = PROMPT_PRESETS.find((p) => p.id === "E")) != null ? _a : PROMPT_PRESETS[0] : activePrompt();
     const payload = {
       model: MODEL,
       messages: [
         { role: "system", content: prompt.system },
-        { role: "user", content: prompt.user.split("{text}").join(finalMasked) }
+        { role: "user", content: prompt.user.split("{text}").join(masked) }
       ],
       temperature: 0,
       // Thinking needs headroom for the reasoning block; flat stays capped
@@ -965,16 +841,6 @@ var grammarCheckerPlugin = import_view.ViewPlugin.fromClass(class {
     if (!corrected)
       return null;
     if (isInstructionEcho(corrected))
-      return null;
-    if (markdownSignature(masked) !== markdownSignature(corrected))
-      return null;
-    if (!linksIntact(masked, corrected))
-      return null;
-    corrected = restoreLinks(corrected, links);
-    if (!mathIntact(corrected, mathSpans))
-      return null;
-    corrected = restoreMath(corrected, mathSpans);
-    if (corrected.length > text.length * 2 + 200)
       return null;
     return corrected;
   }

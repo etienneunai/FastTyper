@@ -267,3 +267,33 @@ export type PushMsg =
   | { type: "settings"; paused: boolean; capitalize: boolean; blacklist: string[]; thinkingMode: ThinkingMode }
   | { type: "acceptAll" }
   | { type: "halt" };
+
+// ---------------------------------------------------------------------------
+// Markdown Masking
+// ---------------------------------------------------------------------------
+
+export const MARKDOWN_REGEX = /```[\s\S]*?```|`[^`\n]+`|\$\$[\s\S]*?\$\$|\$[^$\n]+\$|^---\n[\s\S]*?\n---|!\[\[.*?\]\]|\[\[.*?\]\]|\]\(.*?\)|^[ \t]*#{1,6}\s|^[ \t]*>\s|^[ \t]*[-*+]\s|^[ \t]*\d+\.\s|\*\*|__|==|~~|\*|_|\[|\]/gm;
+
+export function maskMarkdown(text: string): { masked: string, maskChars: string[] } {
+  const maskChars: string[] = [];
+  const masked = text.replace(MARKDOWN_REGEX, (match) => {
+    for (const char of match) maskChars.push(char);
+    return '█'.repeat(match.length);
+  });
+  return { masked, maskChars };
+}
+
+export function restoreMarkdown(corrected: string, maskChars: string[]): string | null {
+  let out = "";
+  let maskIdx = 0;
+  for (let i = 0; i < corrected.length; i++) {
+    if (corrected[i] === '█') {
+      if (maskIdx >= maskChars.length) return null;
+      out += maskChars[maskIdx++];
+    } else {
+      out += corrected[i];
+    }
+  }
+  if (maskIdx !== maskChars.length) return null;
+  return out;
+}

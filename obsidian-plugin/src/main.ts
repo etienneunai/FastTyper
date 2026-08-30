@@ -706,10 +706,10 @@ const grammarCheckerPlugin = ViewPlugin.fromClass(class {
         return { from, to };
     }
 
-    /** True if the line begins a list item ("- ", "* ", "+ ", "1. ", "1) "). */
+    /** True if the line begins a list item ("- ", "* ", "+ ", "1. ", "1) ", "[ ] "). */
     private isListMarkerLine(lineText: string): boolean {
         const t = lineText.trimStart();
-        return /^[-*+]\s/.test(t) || /^\d+[.)]\s/.test(t);
+        return /^[-*+]\s/.test(t) || /^\d+[.)]\s/.test(t) || /^\[[ xX\-]\]\s/.test(t);
     }
 
     /** True if the line is an ATX Markdown heading (`#`, `##`, … up to 6, ≤3 lead spaces). */
@@ -774,7 +774,7 @@ const grammarCheckerPlugin = ViewPlugin.fromClass(class {
                 if (text.length < MIN_UNIT_CHARS) return;
                 
                 let leadingPrefix = '';
-                const prefixMatch = text.match(/^([ \t]*>[ \t]+|[ \t]*[-*+][ \t]+|[ \t]*\d+\.[ \t]+|[ \t]*#{1,6}[ \t]+)/);
+                const prefixMatch = text.match(/^([ \t]*>[ \t]+|[ \t]*[-*+][ \t]+\[[ xX\-]\][ \t]+|[ \t]*\[[ xX\-]\][ \t]+|[ \t]*[-*+][ \t]+|[ \t]*\d+\.[ \t]+|[ \t]*#{1,6}[ \t]+)/);
                 if (prefixMatch) {
                     leadingPrefix = prefixMatch[1];
                 }

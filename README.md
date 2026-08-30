@@ -71,9 +71,8 @@ User types sentence ──► Stopping punct (.?!) / newline ──► 100ms deb
 
 | Model | Size | Notes |
 |---|---|---|
-| `dyslexic-writer-qwen3-4b-q4_k_m.gguf` | ~2.5 GB | **Primary.** Qwen3-4B fine-tune purpose-built for spelling/grammar correction: ~85.6% exact match, ~99.3% leaves correct text untouched. |
-| `qwen2.5-0.5b-instruct-q8_0.gguf` | ~645 MB | Legacy fallback model. |
-| `dyslexic-writer` 1.7B variant | ~1.1 GB | Faster fallback (~82.2% exact match) if latency on 4B is too high. |
+| `dyslexic-writer-qwen3-4b-q4_k_m.gguf` | ~2.5 GB | **Primary.** Qwen3-4B fine-tune purpose-built for spelling/grammar correction: ~85.6% exact match, ~99.3% leaves correct text untouched. Flat inference ~0.2–0.4 s on a 780M iGPU. Use this unless latency is a problem. |
+| `dyslexic-writer-1.7b-q8_0.gguf` | ~1.1 GB | **Lighter fallback.** Qwen-1.7B fine-tune: ~82.2% exact match, noticeably faster. Choose this on lower-powered hardware or if the 4B model's thinking passes (~6–12 s) are too slow. Swap by changing the `-m` path in `fasttyper.service` and the **Model Name** setting in the plugin/extension. |
 
 ### Download Model & Build llama.cpp
 

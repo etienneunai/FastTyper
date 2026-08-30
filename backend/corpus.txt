@@ -1,7 +1,7 @@
 # FastTyper eval corpus (12 items). TEXT<TAB>EXPECTED.
 # PASS = whitespace-collapsed, case-insensitive EXPECTED is a substring of the corrected output.
 # Run:  ./backend/eval-corpus.sh -p E -t on -b 256 backend/corpus.txt
-# Expect 9/10 — item 7 (`youree`→`your`) is a known corpus ambiguity (the model
+# Expect 11/12 — item 7 (`youree`→`your`) is a known corpus ambiguity (the model
 # returns "you're"), not a real failure. Item 10 is scored against its full text
 # so any "improving" corruption of already-correct text flips it to FAIL.
 teh	the

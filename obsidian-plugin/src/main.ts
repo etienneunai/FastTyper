@@ -1,7 +1,6 @@
 import { App, MarkdownView, Notice, Plugin, PluginSettingTab, Setting, requestUrl } from 'obsidian';
-import { StateField, StateEffect, Transaction, ChangeSet, EditorState, type Range, type Text } from '@codemirror/state';
+import { StateField, StateEffect, Transaction, ChangeSet, type Range, type Text } from '@codemirror/state';
 import { Decoration, DecorationSet, EditorView, ViewPlugin, ViewUpdate, hoverTooltip, WidgetType } from '@codemirror/view';
-import { syntaxTree } from '@codemirror/language';
 
 interface AppliedCorrection {
     from: number;
@@ -354,169 +353,9 @@ function isInstructionEcho(corrected: string): boolean {
     return ECHO_MARKERS.some(m => c.includes(m));
 }
 
-/**
- * Signature of the emphasis/strong/strikethrough delimiter runs (`*`, `_`, `~`)
- * in `text`, capturing count + length + order (so `**` ≠ `*` ≠ `_`). Used to
- * reject a model reply that adds, removes, or repositions markdown emphasis
- * markers — e.g. `**important**` "tidied" into `important`. Runs are not
- * position-bound, so fixing a typo inside `**bold**` leaves the signature
- * unchanged and the correction still applies.
- */
-function markdownSignature(text: string): string {
-    const runs: string[] = [];
-    for (let i = 0; i < text.length; i++) {
-        const c = text[i];
-        if (c === '*' || c === '_' || c === '~') {
-            let j = i;
-            while (j < text.length && text[j] === c) j++;
-            runs.push(c.repeat(j - i));
-            i = j - 1;
-        }
-    }
-    return runs.join("|");
-}
-
-/**
- * Obsidian-link protection. Wikilink/embed contents (`[[…]]`, `![[…]]`) are
- * masked with a same-length placeholder before the text is sent to the model, so
- * it never sees filenames, URLs, or tags and can't "fix" them. Because the mask
- * preserves length and the brackets, every non-link character stays at the same
- * offset; after the response, the model must have left each link structurally
- * intact (same bracket count, same inner length) or the correction is rejected,
- * then the original contents are restored before diffing. The LCS then aligns the
- * identical link substrings, so no hunk can touch link content while the rest of
- * the sentence is corrected normally.
- */
-
-/** One `[[` link span: `to`-`from` covers `[[…]]` (or `[[…` to end if `closed` is false). */
-interface LinkSpan { from: number; to: number; inner: string; closed: boolean }
-
-/** Find all Obsidian link spans in `s` (closed `[[…]]`, plus a trailing unclosed `[[…`). */
-function linkSpans(s: string): LinkSpan[] {
-    const spans: LinkSpan[] = [];
-    let i = 0;
-    while (i < s.length - 1) {
-        if (s[i] === "[" && s[i + 1] === "[") {
-            const close = s.indexOf("]]", i + 2);
-            if (close === -1) {
-                spans.push({ from: i, to: s.length, inner: s.slice(i + 2), closed: false });
-                break;
-            }
-            spans.push({ from: i, to: close + 2, inner: s.slice(i + 2, close), closed: true });
-            i = close + 2;
-        } else {
-            i++;
-        }
-    }
-    return spans;
-}
-
-/** Replace every link's inner content with a same-length `·` run (length preserved). */
-function maskLinks(s: string): { masked: string; links: LinkSpan[] } {
-    const spans = linkSpans(s);
-    if (spans.length === 0) return { masked: s, links: [] };
-    let out = "";
-    let last = 0;
-    for (const sp of spans) {
-        out += s.slice(last, sp.from + 2);              // up to and including `[[`
-        out += "·".repeat(sp.inner.length);
-        out += sp.closed ? s.slice(sp.to - 2, sp.to) : ""; // `]]` (absent when unclosed)
-        last = sp.to;
-    }
-    out += s.slice(last);
-    return { masked: out, links: spans };
-}
-
-/** True if `corrected`'s link structure matches `text`'s (count + inner lengths + closed/unclosed). */
-function linksIntact(text: string, corrected: string): boolean {
-    const a = linkSpans(text);
-    const b = linkSpans(corrected);
-    if (a.length !== b.length) return false;
-    for (let i = 0; i < a.length; i++) {
-        if (a[i].inner.length !== b[i].inner.length) return false;
-        if (a[i].closed !== b[i].closed) return false;
-    }
-    return true;
-}
-
-/** Replace each link in `corrected` with the matching original inner content (by order). */
-function restoreLinks(corrected: string, links: LinkSpan[]): string {
-    const spans = linkSpans(corrected);
-    if (spans.length === 0) return corrected;
-    let out = "";
-    let last = 0;
-    for (let k = 0; k < spans.length; k++) {
-        const sp = spans[k];
-        out += corrected.slice(last, sp.from + 2);      // up to and including `[[`
-        out += links[k].inner;                          // original content, not the placeholder
-        out += sp.closed ? corrected.slice(sp.to - 2, sp.to) : "";
-        last = sp.to;
-    }
-    out += corrected.slice(last);
-    return out;
-}
-
-const MATH_MASK = '█'; // U+2588 Full Block
-
-interface MathSpan { from: number; to: number; inner: string; }
-
-function getMathSpans(text: string, offset: number, state: EditorState): MathSpan[] {
-    const spans: MathSpan[] = [];
-    syntaxTree(state).iterate({
-        from: offset,
-        to: offset + text.length,
-        enter: (node) => {
-            const name = node.name.toLowerCase();
-            if (name.includes("math") || name === "equation") {
-                const start = Math.max(0, node.from - offset);
-                const end = Math.min(text.length, node.to - offset);
-                if (end > start) {
-                    spans.push({ from: start, to: end, inner: text.slice(start, end) });
-                }
-            }
-        }
-    });
-
-    const filtered: MathSpan[] = [];
-    for (const sp of spans) {
-        if (!filtered.some(f => sp.from >= f.from && sp.to <= f.to)) {
-            filtered.push(sp);
-        }
-    }
-    filtered.sort((a, b) => a.from - b.from);
-    return filtered;
-}
-
-function maskMath(text: string, spans: MathSpan[]): string {
-    if (spans.length === 0) return text;
-    let out = "";
-    let last = 0;
-    for (const sp of spans) {
-        out += text.slice(last, sp.from);
-        out += MATH_MASK.repeat(sp.inner.length);
-        last = sp.to;
-    }
-    out += text.slice(last);
-    return out;
-}
-
-function mathIntact(corrected: string, spans: MathSpan[]): boolean {
-    for (const sp of spans) {
-        if (!corrected.includes(MATH_MASK.repeat(sp.inner.length))) return false;
-    }
-    return true;
-}
-
-function restoreMath(corrected: string, spans: MathSpan[]): string {
-    let out = corrected;
-    for (const sp of spans) {
-        out = out.replace(MATH_MASK.repeat(sp.inner.length), sp.inner);
-    }
-    return out;
-}
-
-const MAX_CHAR_DIFF_CELLS = 4_000_000;
-const diffBuffer = new Int32Array(MAX_CHAR_DIFF_CELLS + 2000);
+// Maximum real usage: (MAX_UNIT_CHARS + 1) × (MAX_UNIT_CHARS * 2 + 201) = 801 × 1801 = 1,442,601
+const MAX_CHAR_DIFF_CELLS = 1_443_000;
+const diffBuffer = new Int32Array(MAX_CHAR_DIFF_CELLS);
 
 /**
  * Char-level LCS diff of two strings → minimal, ordered hunks `{from,to,replacement}`
@@ -524,10 +363,13 @@ const diffBuffer = new Int32Array(MAX_CHAR_DIFF_CELLS + 2000);
  */
 function charDiff(a: string, b: string): DiffHunk[] {
     const n = a.length, m = b.length;
-    if (n * m > MAX_CHAR_DIFF_CELLS) return a === b ? [] : [{ from: 0, to: n, replacement: b }];
+    // Guard uses (n+1)*(m+1) — the actual cell count including boundary rows/columns.
+    if ((n + 1) * (m + 1) > MAX_CHAR_DIFF_CELLS) return a === b ? [] : [{ from: 0, to: n, replacement: b }];
 
     const width = m + 1;
     const dp = diffBuffer;
+    for (let j = 0; j <= m; j++) dp[n * width + j] = 0;
+    for (let i = 0; i <= n; i++) dp[i * width + m] = 0;
     for (let i = n - 1; i >= 0; i--) {
         for (let j = m - 1; j >= 0; j--) {
             dp[i * width + j] = a.charCodeAt(i) === b.charCodeAt(j)
@@ -578,10 +420,6 @@ function diffWords(a: string, b: string): DiffHunk[] {
 
 // Lazy ~275k-word Set; built on first use (~40 ms) so plugin load stays cheap.
 let _wordSet: Set<string> | null = null;
-function wordSet() {
-    if (_wordSet === null) return new Set<string>(); // safe fallback before loaded
-    return _wordSet;
-}
 
 /**
  * True if `text` has a token that isn't a known English word. Runs only in Auto
@@ -591,20 +429,18 @@ function wordSet() {
  * wordlist can't judge those). Lone lowercase "i" is a real typo for "I" and *is*
  * a dictionary word, so it's flagged explicitly.
  */
-const SUSPECT_REGEX = /[a-z]+(?:'[a-z]+)*/gi;
-
 function hasSuspectTokens(text: string): boolean {
     if (_wordSet === null) return false;
-    SUSPECT_REGEX.lastIndex = 0;
+    const re = /[a-z]+(?:'[a-z]+)*/gi;
     let m: RegExpExecArray | null;
-    while ((m = SUSPECT_REGEX.exec(text)) !== null) {
+    while ((m = re.exec(text)) !== null) {
         const raw = m[0];
         if (/\d/.test(text[m.index - 1] ?? "") || /\d/.test(text[m.index + raw.length] ?? "")) continue;
         if (/[A-Z]/.test(raw)) continue;        // proper nouns + the capitalized sentence start
         const token = raw.toLowerCase();
         if (token.includes("'")) continue;      // don't, it's, James'
         if (token.length === 1) { if (token === "i") return true; continue; }
-        if (!wordSet().has(token)) return true;
+        if (!_wordSet.has(token)) return true;
     }
     return false;
 }
@@ -831,11 +667,13 @@ const grammarCheckerPlugin = ViewPlugin.fromClass(class {
     private sentenceSpan(triggerPos: number): { from: number; to: number } | null {
         const doc = this.view.state.doc;
         const para = this.paragraphRange(triggerPos);
+        const paraText = doc.sliceString(para.from, para.to);
+        const offset = para.from;
 
         // Walk back over the punctuation cluster that includes the trigger ("...", "?!").
         let clusterStart = triggerPos;
         while (clusterStart > para.from) {
-            const c = doc.sliceString(clusterStart - 1, clusterStart);
+            const c = paraText[clusterStart - 1 - offset];
             if (c !== '.' && c !== '?' && c !== '!') break;
             clusterStart--;
         }
@@ -850,7 +688,7 @@ const grammarCheckerPlugin = ViewPlugin.fromClass(class {
         // Scan back to the previous sentence terminator (or the hard stop).
         let from = hardStop;
         for (let i = clusterStart - 1; i >= hardStop; i--) {
-            const c = doc.sliceString(i, i + 1);
+            const c = paraText[i - offset];
             if (c === '.' || c === '?' || c === '!') {
                 from = i + 1;
                 break;
@@ -860,7 +698,7 @@ const grammarCheckerPlugin = ViewPlugin.fromClass(class {
         // Include any trailing closers after the trigger.
         let to = triggerPos + 1;
         while (to < para.to) {
-            const c = doc.sliceString(to, to + 1);
+            const c = paraText[to - offset];
             if (c !== '"' && c !== "'" && c !== ')' && c !== ']' && c !== '}') break;
             to++;
         }
@@ -868,10 +706,10 @@ const grammarCheckerPlugin = ViewPlugin.fromClass(class {
         return { from, to };
     }
 
-    /** True if the line begins a list item ("- ", "* ", "+ ", "1. ", "1) "). */
+    /** True if the line begins a list item ("- ", "* ", "+ ", "1. ", "1) ", "[ ] "). */
     private isListMarkerLine(lineText: string): boolean {
         const t = lineText.trimStart();
-        return /^[-*+]\s/.test(t) || /^\d+[.)]\s/.test(t);
+        return /^[-*+]\s/.test(t) || /^\d+[.)]\s/.test(t) || /^\[[ xX\-]\]\s/.test(t);
     }
 
     /** True if the line is an ATX Markdown heading (`#`, `##`, … up to 6, ≤3 lead spaces). */
@@ -892,12 +730,16 @@ const grammarCheckerPlugin = ViewPlugin.fromClass(class {
     private prevToken(pos: number): string {
         const doc = this.view.state.doc;
         if (pos <= 0) return "";
-        let start = pos;
+        const line = doc.lineAt(pos);
+        const lineText = line.text;
+        const relPos = pos - line.from;
+        if (relPos < 0 || relPos >= lineText.length) return "";
+        let start = relPos;
         while (start > 0) {
-            if (/\s/.test(doc.sliceString(start - 1, start))) break;
+            if (/\s/.test(lineText[start - 1])) break;
             start--;
         }
-        return doc.sliceString(start, pos + 1);
+        return lineText.slice(start, relPos + 1);
     }
 
     
@@ -932,7 +774,7 @@ const grammarCheckerPlugin = ViewPlugin.fromClass(class {
                 if (text.length < MIN_UNIT_CHARS) return;
                 
                 let leadingPrefix = '';
-                const prefixMatch = text.match(/^([ \t]*>[ \t]+|[ \t]*[-*+][ \t]+|[ \t]*\d+\.[ \t]+|[ \t]*#{1,6}[ \t]+)/);
+                const prefixMatch = text.match(/^([ \t]*>[ \t]+|[ \t]*[-*+][ \t]+\[[ xX\-]\][ \t]+|[ \t]*\[[ xX\-]\][ \t]+|[ \t]*[-*+][ \t]+|[ \t]*\d+\.[ \t]+|[ \t]*#{1,6}[ \t]+)/);
                 if (prefixMatch) {
                     leadingPrefix = prefixMatch[1];
                 }

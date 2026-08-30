@@ -62,8 +62,9 @@ export function parseResponse(content: string): string | null {
   return s.length > 0 ? s : null;
 }
 
-const MAX_CHAR_DIFF_CELLS = 4_000_000;
-const diffBuffer = new Int32Array(MAX_CHAR_DIFF_CELLS + 2000);
+// Maximum real usage: (MAX_UNIT_CHARS + 1) × (MAX_UNIT_CHARS * 2 + 201) = 801 × 1801 = 1,442,601
+const MAX_CHAR_DIFF_CELLS = 1_443_000;
+const diffBuffer = new Int32Array(MAX_CHAR_DIFF_CELLS);
 
 /**
  * Char-level LCS diff of two strings → minimal, ordered hunks `{from,to,replacement}`
@@ -71,7 +72,8 @@ const diffBuffer = new Int32Array(MAX_CHAR_DIFF_CELLS + 2000);
  */
 export function charDiff(a: string, b: string): DiffHunk[] {
   const n = a.length, m = b.length;
-  if (n * m > MAX_CHAR_DIFF_CELLS) return a === b ? [] : [{ from: 0, to: n, replacement: b }];
+  // Guard uses (n+1)*(m+1) — the actual cell count including boundary rows/columns.
+  if ((n + 1) * (m + 1) > MAX_CHAR_DIFF_CELLS) return a === b ? [] : [{ from: 0, to: n, replacement: b }];
 
   const width = m + 1;
   const dp = diffBuffer;

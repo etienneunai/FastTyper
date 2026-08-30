@@ -2,6 +2,7 @@
   "manifest_version": 3,
   "name": "FastTyper",
   "version": "0.3.0",
+  "author": "etienneunai",
   "description": "Real-time grammar correction in web text fields, powered by a local llama.cpp daemon.",
   "permissions": ["storage", "tabs"],
   "host_permissions": ["<all_urls>"],

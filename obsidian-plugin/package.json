@@ -1,6 +1,7 @@
 {
   "name": "fasttyper-obsidian",
   "version": "1.0.0",
+  "author": "etienneunai",
   "description": "Real-time grammar correction using local LLM",
   "main": "main.js",
   "scripts": {

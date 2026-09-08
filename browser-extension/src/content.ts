@@ -741,7 +741,7 @@ function wrapRange(root: HTMLElement, from: number, to: number, className: strin
 }
 
 /** Textarea applied ranges (approximate offsets), keyed by field element, for the re-correction guard. */
-const textApplied = new Map<HTMLElement, { from: number; to: number }[]>();
+const textApplied = new WeakMap<HTMLElement, { from: number; to: number }[]>();
 
 function registerTextApplied(field: Field, ranges: { from: number; to: number }[]): void {
   const el = field.el;
@@ -856,7 +856,8 @@ function acceptAll(): void {
     d.span.replaceWith(...Array.from(d.span.childNodes));
   }
   decos.length = 0;
-  textApplied.clear();
+  // WeakMap has no .clear(); unregister per-pill applied ranges instead.
+  for (const p of pills) unregisterTextApplied(p.field, p.appliedRanges);
   hideTooltip();
   dismissAllPills();
 }
@@ -871,27 +872,28 @@ interface Pill {
 }
 const pills: Pill[] = [];
 
-/** The corrected sentence, with each changed word shown as `was → now`. */
+/** Make whitespace visible by replacing spaces with middle dots. */
+function visibleSpaces(s: string): string { return s.replace(/ /g, "\u00B7"); }
+
+/** Compact diff summary: only the changed hunks, separated by " · ". */
 function buildHighlighted(trimmed: string, hunks: DiffHunk[]): HTMLElement {
   const body = document.createElement("div");
   body.className = "ft-pill-body";
-  let pos = 0;
-  for (const h of hunks) {
-    if (h.from > pos) body.appendChild(document.createTextNode(trimmed.slice(pos, h.from)));
+  for (let i = 0; i < hunks.length; i++) {
+    if (i > 0) body.appendChild(document.createTextNode(" · "));
+    const h = hunks[i];
     const mark = document.createElement("span");
     mark.className = "ft-pill-change";
     const was = document.createElement("span");
     was.className = "ft-pill-was";
-    was.textContent = trimmed.slice(h.from, h.to) || "∅";
+    was.textContent = visibleSpaces(trimmed.slice(h.from, h.to)) || "∅";
     const arrow = document.createTextNode(" → ");
     const now = document.createElement("span");
     now.className = "ft-pill-now";
-    now.textContent = h.replacement;
+    now.textContent = visibleSpaces(h.replacement) || "∅";
     mark.append(was, arrow, now);
     body.appendChild(mark);
-    pos = h.to;
   }
-  if (pos < trimmed.length) body.appendChild(document.createTextNode(trimmed.slice(pos)));
   return body;
 }
 
@@ -930,8 +932,13 @@ function showCorrectionPill(field: Field, base: number, trimmed: string, hunks: 
   registerTextApplied(field, appliedRanges);
 
   positionPill(pill, field.el);
-  const timer = setTimeout(() => removePill(pill), 8000);
-  pills.push({ el: pill, field, undoHunks, appliedRanges, timer });
+  let timer = setTimeout(() => removePill(pill), 8000);
+  const p: Pill = { el: pill, field, undoHunks, appliedRanges, timer };
+  pills.push(p);
+
+  // Pause auto-hide while the user is hovering (e.g. moving to the Undo button).
+  pill.addEventListener("mouseenter", () => { clearTimeout(p.timer); });
+  pill.addEventListener("mouseleave", () => { p.timer = setTimeout(() => removePill(pill), 3000); });
 }
 
 function positionPill(pill: HTMLElement, anchor: HTMLElement): void {
@@ -1118,5 +1125,28 @@ document.addEventListener("input", (e) => {
 
 document.addEventListener("focusin", (e) => {
   if (siteDisabled) return;
+  // Sweep orphaned decos (SPA re-renders, user deleted corrected text).
+  for (let i = decos.length - 1; i >= 0; i--) {
+    if (!document.body.contains(decos[i].span)) decos.splice(i, 1);
+  }
   onFocusIn(e.target as HTMLElement);
 }, true);
+
+// ---------------------------------------------------------------------------
+// Scroll / resize: reposition all floating elements so they track their anchor
+// ---------------------------------------------------------------------------
+
+let rafPending = false;
+function repositionFloaters(): void {
+  if (rafPending) return;
+  rafPending = true;
+  requestAnimationFrame(() => {
+    rafPending = false;
+    for (const p of pills) positionPill(p.el, p.field.el);
+    if (processingPill) positionPill(processingPill.el, processingPill.field.el);
+    hideTooltip(); // tooltip re-appears on next mouseenter
+  });
+}
+
+document.addEventListener("scroll", repositionFloaters, { capture: true, passive: true });
+window.addEventListener("resize", repositionFloaters, { passive: true });

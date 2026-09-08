@@ -8,10 +8,11 @@ body {
 }
 h1 { font-size: 15px; margin: 0 0 10px; }
 .row { display: flex; align-items: center; gap: 8px; margin: 6px 0; }
+.btn-row { display: flex; gap: 6px; margin-top: 8px; }
 .btn {
-  width: 100%;
-  margin-top: 8px;
+  flex: 1;
   padding: 6px;
+  font: 13px/1.4 system-ui, sans-serif;
   color: #fff;
   background: #3b82f6;
   border: none;
@@ -19,10 +20,32 @@ h1 { font-size: 15px; margin: 0 0 10px; }
   cursor: pointer;
 }
 .btn:hover { background: #2563eb; }
-.status { margin-top: 10px; font-size: 12px; }
+.btn-secondary { background: #64748b; }
+.btn-secondary:hover { background: #475569; }
+.status { margin: 0 0 8px; font-size: 12px; }
 .status.ok { color: #16a34a; }
 .status.bad { color: #dc2626; }
-.bl-label { display: block; margin-top: 10px; font-size: 12px; color: #555; }
+
+/* Collapsible sections */
+.section {
+  margin-top: 10px;
+  border: 1px solid #e2e8f0;
+  border-radius: 6px;
+  padding: 0;
+}
+.section > summary {
+  padding: 6px 10px;
+  font-weight: 600;
+  font-size: 12px;
+  color: #475569;
+  cursor: pointer;
+  user-select: none;
+}
+.section > summary:hover { color: #1e293b; }
+.section > *:not(summary) { padding: 0 10px; }
+.section > *:last-child { padding-bottom: 10px; }
+
+.bl-label { display: block; margin-top: 8px; font-size: 12px; color: #555; }
 select.sel,
 input.txt {
   width: 100%;
@@ -45,7 +68,7 @@ textarea#blacklist {
   border-radius: 6px;
   resize: vertical;
 }
-details { margin-top: 10px; }
+details#logWrap { margin-top: 10px; border: none; padding: 0; }
 pre {
   max-height: 180px;
   overflow: auto;

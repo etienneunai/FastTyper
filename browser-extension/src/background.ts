@@ -149,6 +149,28 @@ async function wordSet(): Promise<Set<string>> {
 // capitalized sentence start), or apostrophe tokens (contractions). Lone
 // lowercase "i" is a real typo for "I" and *is* a dictionary word, so it's
 // flagged explicitly.
+function isValidWord(token: string, ws: Set<string>): boolean {
+  if (ws.has(token)) return true;
+  if (token.endsWith("ed")) {
+    if (ws.has(token.slice(0, -2))) return true; // spellchecked -> spellcheck
+    if (ws.has(token.slice(0, -1))) return true; // baked -> bake
+    if (token.length > 4 && token[token.length - 3] === token[token.length - 4] && ws.has(token.slice(0, -3))) return true; // stopped -> stop
+  }
+  if (token.endsWith("ing")) {
+    if (ws.has(token.slice(0, -3))) return true; // spelling -> spell
+    if (ws.has(token.slice(0, -3) + "e")) return true; // dancing -> dance
+    if (token.length > 5 && token[token.length - 4] === token[token.length - 5] && ws.has(token.slice(0, -4))) return true; // running -> run
+  }
+  if (token.endsWith("s")) {
+    if (ws.has(token.slice(0, -1))) return true; // words -> word
+    if (token.endsWith("es") && ws.has(token.slice(0, -2))) return true; // boxes -> box
+  }
+  if (token.endsWith("ly")) {
+    if (ws.has(token.slice(0, -2))) return true; // quickly -> quick
+  }
+  return false;
+}
+
 const SUSPECT_REGEX = /[a-z]+(?:'[a-z]+)*/gi;
 async function hasSuspectTokens(text: string): Promise<boolean> {
   const ws = await wordSet();
@@ -161,7 +183,7 @@ async function hasSuspectTokens(text: string): Promise<boolean> {
     const token = raw.toLowerCase();
     if (token.includes("'")) continue;      // don't, it's, James'
     if (token.length === 1) { if (token === "i") return true; continue; }
-    if (!ws.has(token)) return true;
+    if (!isValidWord(token, ws)) return true;
   }
   return false;
 }

@@ -100,6 +100,7 @@ browser.runtime.onMessage.addListener((msg: PushMsg) => {
 interface Field {
   el: HTMLElement;
   kind: "textarea" | "contenteditable";
+  isVirtual?: boolean;
   readText(): string;
   caret(): number;
   setCaret(pos: number): void;
@@ -303,10 +304,20 @@ function modelRange(model: ContentModel, from: number, to: number): Range {
   return range;
 }
 
+function isVirtualDomEditor(el: HTMLElement): boolean {
+  return !!el.closest(
+    "[data-lexical-editor], [data-slate-editor], .ProseMirror, .DraftEditor-root, [data-contents='true'], .ql-editor, [role='textbox'][contenteditable='true'], [role='combobox'][contenteditable='true']"
+  );
+}
+
 class ContentEditableField implements Field {
   el: HTMLElement;
   kind: "contenteditable" = "contenteditable";
-  constructor(el: HTMLElement) { this.el = el; }
+  isVirtual: boolean;
+  constructor(el: HTMLElement) {
+    this.el = el;
+    this.isVirtual = isVirtualDomEditor(el);
+  }
   private _cachedModel: ContentModel | null = null;
   private model(): ContentModel {
     if (this._cachedModel) return this._cachedModel;
@@ -614,7 +625,7 @@ class Corrector {
           if (q.field.readText().slice(q.from, q.to).trim() !== trimmed) return;
           const hunks = diffWords(trimmed, final);
           if (hunks.length > 0) {
-            const changes = applyHunks(q.field, q.from, lead, trimmed, hunks);
+            const changes = applyHunks(q.field, q.from, lead, trimmed, hunks, final);
             for (const pending of this.queued) {
               if (pending.field === q.field) {
                 pending.from = mapCaret(pending.from, changes);
@@ -762,7 +773,7 @@ function unregisterTextApplied(field: Field, ranges: { from: number; to: number 
 
 /** True if the unit [from,to) overlaps an active (un-accepted) correction in this field. */
 function hasAppliedOverlap(field: Field, from: number, to: number): boolean {
-  if (field.kind === "contenteditable") {
+  if (field.kind === "contenteditable" && !field.isVirtual) {
     const model = buildModel(field.el);
     for (const d of decos) {
       if (!field.el.contains(d.span)) continue;
@@ -782,7 +793,7 @@ function hasAppliedOverlap(field: Field, from: number, to: number): boolean {
 
 export let isApplying = false;
 
-function applyHunks(field: Field, spanStart: number, lead: number, trimmed: string, hunks: DiffHunk[]): { from: number; to: number; ins: string }[] {
+function applyHunks(field: Field, spanStart: number, lead: number, trimmed: string, hunks: DiffHunk[], finalText?: string): { from: number; to: number; ins: string }[] {
   isApplying = true;
   try {
     const base = spanStart + lead;
@@ -801,6 +812,19 @@ function applyHunks(field: Field, spanStart: number, lead: number, trimmed: stri
       field.setValue(v);
       field.setCaret(mapCaret(caretBefore, changes));
       showCorrectionPill(field, base, trimmed, hunks);
+      return changes;
+    }
+
+    // Virtual-DOM contenteditable (Lexical, Slate, ProseMirror, etc.):
+    // Perform a single atomic replacement over the target unit and use the
+    // floating pill for Undo. NEVER inject <span> tags into their private AST!
+    if (field.isVirtual && finalText !== undefined) {
+      const caretBefore = field.caret();
+      const changes = [{ from: base, to: base + trimmed.length, ins: finalText }];
+      field.replace(base, base + trimmed.length, finalText);
+      field.invalidate();
+      field.setCaret(mapCaret(caretBefore, changes));
+      showCorrectionPill(field, base, trimmed, hunks, finalText);
       return changes;
     }
 
@@ -898,7 +922,7 @@ function buildHighlighted(trimmed: string, hunks: DiffHunk[]): HTMLElement {
 }
 
 /** One pill per correction event, aggregating every hunk in the sentence. */
-function showCorrectionPill(field: Field, base: number, trimmed: string, hunks: DiffHunk[]): void {
+function showCorrectionPill(field: Field, base: number, trimmed: string, hunks: DiffHunk[], finalText?: string): void {
   const pill = document.createElement("div");
   pill.className = "ft-pill";
   pill.appendChild(buildHighlighted(trimmed, hunks));
@@ -922,13 +946,18 @@ function showCorrectionPill(field: Field, base: number, trimmed: string, hunks: 
 
   // Record the applied range (guard against re-correcting while editing) and
   // the reverse hunks (undo), all in post-apply field coordinates.
-  const appliedRanges = hunks.map((h) => ({ from: base + h.from, to: base + h.to }));
-  const undoHunks = hunks.map((h) => ({
-    from: base + h.from,
-    len: h.replacement.length,
-    original: trimmed.slice(h.from, h.to),
-    ins: h.replacement,
-  }));
+  const appliedRanges = field.isVirtual && finalText !== undefined
+    ? [{ from: base, to: base + finalText.length }]
+    : hunks.map((h) => ({ from: base + h.from, to: base + h.to }));
+
+  const undoHunks = field.isVirtual && finalText !== undefined
+    ? [{ from: base, len: finalText.length, original: trimmed, ins: finalText }]
+    : hunks.map((h) => ({
+        from: base + h.from,
+        len: h.replacement.length,
+        original: trimmed.slice(h.from, h.to),
+        ins: h.replacement,
+      }));
   registerTextApplied(field, appliedRanges);
 
   positionPill(pill, field.el);
@@ -983,7 +1012,19 @@ function undoPill(pill: HTMLElement): void {
     }
   }
   if (changes.length > 0) {
-    p.field.setValue(nv);
+    if (p.field.kind === "textarea") {
+      p.field.setValue(nv);
+    } else {
+      isApplying = true;
+      try {
+        for (const ch of changes) {
+          p.field.replace(ch.from, ch.to, ch.ins);
+        }
+        p.field.invalidate();
+      } finally {
+        isApplying = false;
+      }
+    }
     p.field.setCaret(mapCaret(caretBefore, changes));
   }
   unregisterTextApplied(p.field, p.appliedRanges);

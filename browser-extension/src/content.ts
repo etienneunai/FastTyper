@@ -22,7 +22,7 @@
  */
 import {
   TRIGGER_VERIFY_MS, MAX_UNIT_CHARS, MIN_UNIT_CHARS, ABBREVIATIONS,
-  diffWords, capitalizeInitial, contextSnippet, maskMarkdown, restoreMarkdown,
+  diffWords, capitalizeInitial, contextSnippet,
   type DiffHunk, type PushMsg, type ThinkingMode, type Response
 } from "./shared";
 
@@ -425,6 +425,12 @@ function prevToken(text: string, pos: number): string {
   return text.slice(start, pos + 1);
 }
 
+/** True if the line begins a list item ("- ", "* ", "+ ", "1. ", "1) ", "[ ] "). */
+function isListMarkerLine(lineText: string): boolean {
+  const t = lineText.trimStart();
+  return /^[-*+]\s/.test(t) || /^\d+[.)]\s/.test(t) || /^\[[ xX\-]\]\s/.test(t);
+}
+
 function sentenceSpan(text: string, blockStart: number, blockEnd: number, triggerPos: number): { from: number; to: number } {
   let clusterStart = triggerPos;
   while (clusterStart > blockStart) {
@@ -432,8 +438,15 @@ function sentenceSpan(text: string, blockStart: number, blockEnd: number, trigge
     if (c !== "." && c !== "?" && c !== "!") break;
     clusterStart--;
   }
-  let from = blockStart;
-  for (let i = clusterStart - 1; i >= blockStart; i--) {
+
+  // A list item should not swallow previous items: clamp scan-back to the line start.
+  const prevNl = text.lastIndexOf("\n", triggerPos - 1);
+  const lineStart = prevNl === -1 ? 0 : prevNl + 1;
+  const lineText = text.slice(lineStart, triggerPos + 1);
+  const hardStop = isListMarkerLine(lineText) ? Math.max(blockStart, lineStart) : blockStart;
+
+  let from = hardStop;
+  for (let i = clusterStart - 1; i >= hardStop; i--) {
     const c = text[i];
     if (c === "." || c === "?" || c === "!") { from = i + 1; break; }
   }
@@ -514,6 +527,24 @@ class Corrector {
       if (ABBREVIATIONS.has(prevToken(text, pos))) return;
     }
 
+    // A newline must not re-trigger a line whose terminating punctuation
+    // already fired the sentence trigger (avoids double-processing a line
+    // that ends with . ? !).
+    if (ch === "\n") {
+      if (pos <= 0) return;
+      const prevNL = text.lastIndexOf("\n", pos - 1);
+      const lineText = text.slice(prevNL + 1, pos);
+      const lastNonWs = lineText.trimEnd();
+      if (lastNonWs.length > 0) {
+        const lastCh = lastNonWs[lastNonWs.length - 1];
+        if (lastCh === "?" || lastCh === "!") return;
+        if (lastCh === ".") {
+          const prev = prevToken(text, prevNL + 1 + lastNonWs.length - 1);
+          if (!(prev && ABBREVIATIONS.has(prev))) return;
+        }
+      }
+    }
+
     const blockStart = field.blockStart(pos);
     const blockEnd = field.blockEnd(pos);
     const span = ch === "\n"
@@ -522,8 +553,7 @@ class Corrector {
     if (span.to - span.from > MAX_UNIT_CHARS) return;
     const unit = text.slice(span.from, span.to);
     if (unit.trim().length < MIN_UNIT_CHARS) return;
-    const { masked } = maskMarkdown(unit);
-    if (!/[a-zA-Z]/.test(masked.replace(/█/g, ''))) return;
+    if (!/[a-zA-Z]/.test(unit)) return;
 
     // If the unit overlaps an already-applied (still-active) correction, the
     // user is editing the corrected text — don't substitute over it again.
@@ -550,8 +580,7 @@ class Corrector {
       const trimmed = raw.trim();
       const lead = raw.length - raw.trimStart().length;
       if (trimmed.length < MIN_UNIT_CHARS) return;
-      const { masked, maskChars } = maskMarkdown(trimmed);
-      if (!/[a-zA-Z]/.test(masked.replace(/█/g, ''))) return;
+      if (!/[a-zA-Z]/.test(trimmed)) return;
 
       // "auto" tries flat once, then escalates to E + thinking ONLY if flat
       // changed nothing. A thinking no-op is final (thinking is non-deterministic
@@ -560,10 +589,8 @@ class Corrector {
       for (let attempt = 0; attempt < maxAttempts; attempt++) {
         const thinking = thinkingMode === "always" || attempt === 1;
         if (thinking) updateProcessingPill(q.field, true);
-        const correctedMasked = await this.request(masked, thinking);
+        const corrected = await this.request(trimmed, thinking);
         if (this.gen !== g || paused || active !== q.field) return;
-        if (!correctedMasked) return;
-        const corrected = restoreMarkdown(correctedMasked, maskChars);
         if (!corrected) return;
 
         const rawCorrected = corrected;

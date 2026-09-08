@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "FastTyper",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "author": "etienneunai",
   "description": "Real-time grammar correction in web text fields, powered by a local llama.cpp daemon.",
   "permissions": ["storage", "tabs"],
@@ -30,6 +30,14 @@
     "halt-corrections": {
       "suggested_key": { "default": "Ctrl+Shift+E" },
       "description": "Halt the current correction (discard in-flight request)"
+    },
+    "cycle-thinking-mode": {
+      "suggested_key": { "default": "Ctrl+Shift+Y" },
+      "description": "Cycle FastTyper thinking mode (fast/auto/always)"
+    },
+    "accept-all-corrections": {
+      "suggested_key": { "default": "Ctrl+Shift+A" },
+      "description": "Accept all FastTyper corrections"
     }
   }
 }

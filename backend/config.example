@@ -1,0 +1,46 @@
+# FastTyper Daemon Configuration Template
+# Copy this file to ~/.config/fasttyper/config (or /etc/fasttyper/config for system-wide defaults)
+
+# Network binding
+PORT=8808
+HOST=127.0.0.1
+
+# Path to llama-server binary.
+# Defaults to ~/.local/bin/llama-server, with fallback to /usr/local/bin/llama-server or PATH.
+# LLAMA_SERVER_BIN="$HOME/.local/bin/llama-server"
+
+# Path to the GGUF model file.
+# Default: 4B Q4_K_M model (~2.5 GB)
+MODEL="$HOME/.local/share/models/dyslexic-writer-qwen3-4b-q4_k_m.gguf"
+# For lower-powered hardware, use the 1.7B Q4_K_M fallback model (~1.1 GB):
+# MODEL="$HOME/.local/share/models/dyslexic-writer-1.7b-q4_k_m.gguf"
+
+# Number of layers to offload to GPU (99 offloads all layers).
+# Reduce this if your GPU runs out of VRAM (e.g. N_GPU_LAYERS=20).
+N_GPU_LAYERS=99
+
+# Context window size. 2048 is recommended to avoid wasting system/GPU RAM.
+CTX_SIZE=2048
+
+# Number of CPU threads to use during inference.
+THREADS=4
+
+# Additional llama-server arguments.
+# -cb: Continuous batching
+# --reasoning off: Force-disable Qwen3 thinking mode for base passes
+EXTRA_ARGS="-cb --reasoning off"
+
+# --- GPU / Vendor Specific Tuning (Optional) ---
+# For AMD RADV driver async compute optimization:
+# AMD_VULKAN_ASYNC_COMPUTE=1
+
+# For explicit Vulkan ICD selection (if multiple drivers are installed):
+# VK_ICD_FILENAMES="/usr/share/vulkan/icd.d/radeon_icd.json"
+
+# For explicit GPU device selection (e.g. device 0):
+# LLAMA_ARG_DEVICE=0
+# Or for Vulkan visible devices:
+# GGML_VK_VISIBLE_DEVICES=0
+
+# For single UMA iGPU systems, prevent multi-GPU splitting:
+# EXTRA_ARGS="-cb --reasoning off --split-mode none"

@@ -27,13 +27,14 @@
 # whitespace-collapsed). For multi-token expectations put the whole phrase in the
 # second column; for "contains any of several words" use a plain (no-expected) line.
 #
-# DEPENDENCIES: curl, python3, jq. The daemon must be running (see README / CLAUDE.md).
+# DEPENDENCIES: python3. The daemon must be running (see README / AGENTS.md).
 #
 # EXAMPLE
 #   printf 'teh\tthe\nson much betternow\tso much better now\n' > /tmp/corpus.txt
 #   ./backend/eval-corpus.sh -p E -t on -b 256 /tmp/corpus.txt
 #
 set -u
+export LC_ALL="${LC_ALL:-C.UTF-8}"
 
 # ---- config ----
 PRESET="A"
@@ -76,8 +77,8 @@ if [[ -n "$BUDGET" ]] && ! [[ "$BUDGET" =~ ^-?[0-9]+$ ]]; then
     exit 2
 fi
 case "$PRESET" in A|B|E|C) ;; *) echo "error: -p must be A, B, E or C" >&2; exit 2 ;; esac
-if ! command -v curl >/dev/null || ! command -v python3 >/dev/null || ! command -v jq >/dev/null; then
-    echo "error: this script needs curl, python3 and jq on PATH" >&2
+if ! command -v python3 >/dev/null 2>&1; then
+    echo "error: this script needs python3 on PATH" >&2
     exit 2
 fi
 
@@ -102,6 +103,9 @@ echo "== corpus: $CORPUS =="
 n=0; passed=0; failed=0; skipped=0; errors=0
 times=()
 
+worker_err_file="$(mktemp)"
+trap 'rm -f "$worker_err_file"' EXIT
+
 while IFS= read -r line || [[ -n "$line" ]]; do
     line="${line%$'\r'}"
     case "$line" in ''|\#*) continue ;; esac
@@ -112,20 +116,21 @@ while IFS= read -r line || [[ -n "$line" ]]; do
     fi
 
     user_msg="${USER[$PRESET]//\{text\}/$input}"
-    t0="$(date +%s%N)"
-    resp="$(python3 "$WORKER" "${SYS[$PRESET]}" "$user_msg" "$THINK_BOOL" "$BUDGET" "$MODEL" "$URL" "$expected" "$MSG" 2>/dev/null)"
+    resp="$(python3 "$WORKER" "${SYS[$PRESET]}" "$user_msg" "$THINK_BOOL" "$BUDGET" "$MODEL" "$URL" "$expected" "$MSG" 2>"$worker_err_file")"
     rc=$?
-    t1="$(date +%s%N)"
-    lat="$(awk -v a="$t0" -v b="$t1" 'BEGIN{printf "%.3f", (b-a)/1e9}')"
-    times+=("$lat")
 
-    out="$(jq -r '.out // ""' <<<"$resp" 2>/dev/null)"
-    verdict="$(jq -r '.verdict // "ERROR"' <<<"$resp" 2>/dev/null)"
-    err="$(jq -r '.error // ""' <<<"$resp" 2>/dev/null)"
-    if [[ "$rc" -ne 0 || -z "$resp" || -z "$verdict" ]]; then
-        verdict="ERROR"; err="worker failed (rc=$rc)"
+    lat="0.000"; verdict="ERROR"; out=""; err=""
+    if [[ -n "$resp" ]]; then
+        IFS=$'\t' read -r lat verdict out err <<< "$resp"
     fi
 
+    if [[ "$rc" -ne 0 || -z "$verdict" ]]; then
+        verdict="ERROR"
+        worker_stderr="$(<"$worker_err_file")"
+        err="worker failed (rc=$rc)${worker_stderr:+: $worker_stderr}"
+    fi
+
+    times+=("$lat")
     n=$((n + 1))
     case "$verdict" in
         PASS) passed=$((passed + 1)) ;;

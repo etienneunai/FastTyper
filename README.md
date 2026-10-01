@@ -50,7 +50,7 @@ User types sentence ──► Stopping punct (.?!) / newline ──► 100ms deb
 2. **Capture & Markdown Protection** — For punctuation, captures the completed sentence (with `.?!`-cluster, abbreviation, and decimal heuristics); for newline, captures the completed line. Structural Markdown markers (`#`, `*`, `>`, `[[wiki]]`, math `$..$`, code blocks, inline code) are masked before sending to the model and restored afterwards to protect formatting. Units consisting purely of markdown formatting or exceeding 800 characters are skipped.
 3. **Thinking Mode & Escalation**:
    - **Fast**: Flat inference only (~0.4s).
-   - **Auto** (default): Runs flat inference first. If the output is unchanged (a no-op) or contains suspect non-dictionary tokens (checked against the bundled ~275k `wordlist.json`), it escalates **once** to Preset E with Qwen3 thinking enabled (`reasoning_budget_tokens: 256`, ~6–12s).
+   - **Auto** (default): Runs flat inference first. If the output is unchanged (a no-op) or contains suspect non-dictionary tokens (checked against the bundled ~275k `wordlist.json` with suffix stemming), it escalates **once** to Preset E with Qwen3 thinking enabled (`reasoning_budget_tokens: 256`, ~6–12s).
    - **Always**: Runs every request with thinking enabled.
    - In-flight requests are highlighted amber (`.ft-processing`, pulsing while thinking via `.ft-processing-thinking` in Obsidian; status pill in browser).
 4. **Minimal LCS Diff** — The model returns the full corrected text. FastTyper computes a character-level Longest Common Subsequence (LCS) diff to apply only the exact modified spans in place.
@@ -72,18 +72,28 @@ User types sentence ──► Stopping punct (.?!) / newline ──► 100ms deb
 | Model | Size | Notes |
 |---|---|---|
 | `dyslexic-writer-qwen3-4b-q4_k_m.gguf` | ~2.5 GB | **Primary.** Qwen3-4B fine-tune purpose-built for spelling/grammar correction: ~85.6% exact match, ~99.3% leaves correct text untouched. Flat inference ~0.2–0.4 s on a 780M iGPU. Use this unless latency is a problem. |
-| `dyslexic-writer-1.7b-q8_0.gguf` | ~1.1 GB | **Lighter fallback.** Qwen-1.7B fine-tune: ~82.2% exact match, noticeably faster. Choose this on lower-powered hardware or if the 4B model's thinking passes (~6–12 s) are too slow. Swap by changing the `-m` path in `fasttyper.service` and the **Model Name** setting in the plugin/extension. |
+| `dyslexic-writer-1.7b-q4_k_m.gguf` | ~1.1 GB | **Lighter fallback.** Qwen-1.7B fine-tune (`q4_k_m`): ~82.2% exact match, noticeably faster. Choose this on lower-powered hardware or if the 4B model's thinking passes (~6–12 s) are too slow. Swap by setting `MODEL` in `~/.config/fasttyper/config` and the **Model Name** setting in the plugin/extension. |
+
+### System Prerequisites
+
+Building the backend requires standard C++ and GPU acceleration toolchains:
+- **Ubuntu/Debian**: `sudo apt update && sudo apt install -y build-essential cmake git curl libvulkan-dev glslc`
+- **Fedora/RHEL**: `sudo dnf install -y gcc-c++ make cmake git curl vulkan-headers vulkan-loader-devel glslc`
+- **Arch Linux**: `sudo pacman -S --needed base-devel cmake git curl vulkan-headers vulkan-icd-loader shaderc`
 
 ### Download Model & Build llama.cpp
 
-Run the backend setup script:
+Run the backend setup script from the root of the repository:
 
 ```bash
-cd backend
-bash setup.sh
+# Downloads the 4B model by default and compiles llama-server with Vulkan
+./backend/setup.sh
+
+# Or to download the 1.7B fallback model:
+./backend/setup.sh 1.7b
 ```
 
-`setup.sh` downloads the primary model to `~/.local/share/models/`, builds `llama.cpp` with Vulkan support (`~/.local/src/llama.cpp`), and installs `llama-server` and its shared libraries to `/usr/local`.
+`setup.sh` downloads the chosen model to `~/.local/share/models/`, builds `llama.cpp` scoped to `llama-server` (`~/.local/src/llama.cpp`), and installs it rootlessly to `~/.local/bin` with `$ORIGIN`-relative library RPATH.
 
 Or download the model manually:
 
@@ -95,14 +105,14 @@ wget -c -O ~/.local/share/models/dyslexic-writer-qwen3-4b-q4_k_m.gguf \
 
 ---
 
-## Backend (llama.cpp Daemon)
+## Backend Daemon
 
-The backend runs as a systemd user service listening on `http://127.0.0.1:8808/v1/chat/completions`.
+The backend listens on `http://127.0.0.1:8808/v1/chat/completions`.
 
-### 1. Enable & Start the Service
+### Option A: Systemd User Service (Linux)
 
 ```bash
-# Symlink service file to systemd user directory
+# Symlink service file to systemd user directory (run from the repository root)
 mkdir -p ~/.config/systemd/user
 ln -sf "$(pwd)/backend/fasttyper.service" ~/.config/systemd/user/fasttyper.service
 
@@ -114,12 +124,38 @@ systemctl --user enable --now fasttyper
 journalctl --user -u fasttyper -f
 ```
 
-Verify Vulkan offload engaged (check for `/dev/dri/renderD*` usage and no `no usable GPU found` warnings).
+### Option B: Standalone Runner (Non-Systemd / Containers / macOS)
 
-> [!NOTE]
-> `backend/fasttyper.service` is preconfigured to bind to AMD Vulkan drivers (`VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/radeon_icd.json`) to run on integrated GPUs (e.g. Radeon 780M) to save discrete GPU battery and thermals. If running on Intel or Nvidia hardware, modify or remove `VK_ICD_FILENAMES` in `fasttyper.service` or override via `~/.config/fasttyper/config`.
+Run the standalone runner script directly:
 
-### 2. Regression & Corpus Evaluation
+```bash
+./backend/run-daemon.sh
+```
+
+Or run `llama-server` directly with your preferred flags:
+
+```bash
+llama-server \
+  -m ~/.local/share/models/dyslexic-writer-qwen3-4b-q4_k_m.gguf \
+  --port 8808 \
+  --host 127.0.0.1 \
+  -ngl 99 \
+  -cb \
+  -c 2048 \
+  --threads 4 \
+  --reasoning off
+```
+
+### Configuration
+
+Copy the example configuration to customize ports, paths, or GPU device selection without modifying tracked files:
+
+```bash
+mkdir -p ~/.config/fasttyper
+cp backend/config.example ~/.config/fasttyper/config
+```
+
+### Regression & Corpus Evaluation
 
 Run the evaluation test suite against the live daemon:
 
@@ -137,19 +173,19 @@ Prerequisites: Node.js & npm.
 
 ```bash
 cd obsidian-plugin
-npm install --legacy-peer-deps
+npm install
 npm run build
 ```
 
-Copy the build output and **runtime wordlist** to your Obsidian vault:
+Copy the build output to your Obsidian vault:
 
 ```bash
-mkdir -p ~/path/to/YourVault/.obsidian/plugins/fasttyper/
-cp -r {main.js,manifest.json,styles.css,wordlist.json} ~/path/to/YourVault/.obsidian/plugins/fasttyper/
+mkdir -p "~/path/to/Your Vault/.obsidian/plugins/fasttyper/"
+cp -r main.js manifest.json styles.css "~/path/to/Your Vault/.obsidian/plugins/fasttyper/"
 ```
 
-> [!IMPORTANT]
-> `wordlist.json` is a **required runtime asset** (~275k English words). It is loaded asynchronously at plugin startup and powers the suspect-token dictionary check for Auto Thinking Mode escalation. Always copy `wordlist.json` alongside `main.js`.
+> [!NOTE]
+> The dictionary wordlist is pre-compressed and bundled directly into `main.js`, ensuring 100% offline functionality without extra file copies.
 
 Reload Obsidian (`Ctrl+R`) and enable **FastTyper** in **Settings → Community plugins**.
 
@@ -186,7 +222,7 @@ Universal real-time grammar correction across web text fields, communicating wit
 - **Protected Fields**: Password/credential fields, Google Docs (canvas), and hidden-textarea mirrored editors (CodeMirror, Monaco, Notion) are automatically bypassed.
 - **Domain Blacklist**: Block specific hostnames or subdomains from the popup.
 - **Revert UX**: Contenteditable fields get inline wavy underlines and hover tooltips; plain textareas get transient diff pills with one-click sentence undo.
-- **Shortcuts**: `Ctrl+Shift+F` (Pause/Resume), `Ctrl+Shift+E` (Halt in-flight request and abort daemon connection), `Ctrl+Shift+Y` (Cycle thinking mode), `Ctrl+Shift+A` (Accept all active corrections).
+- **Shortcuts**: `Alt+Shift+F` (Pause/Resume), `Alt+Shift+H` (Halt in-flight request), `Alt+Shift+Y` (Cycle thinking mode), `Alt+Shift+A` (Accept all active corrections).
 
 ### Build & Load in Firefox
 
@@ -199,6 +235,13 @@ npm run build
 1. Open Firefox and navigate to `about:debugging#/runtime/this-firefox`.
 2. Click **Load Temporary Add-on...**
 3. Select `browser-extension/dist/manifest.json`.
+
+> [!TIP]
+> **Session Persistence**: Extensions loaded via `about:debugging` are temporary and unload when Firefox closes. For persistent local development and testing, you can use the Mozilla `web-ext` CLI tool:
+> ```bash
+> npx web-ext run --source-dir browser-extension/dist
+> ```
+> Or install as a signed/self-hosted XPI in Firefox Developer Edition / Nightly.
 
 ---
 
@@ -224,25 +267,29 @@ FastTyper uses purpose-crafted system and user prompt presets:
 ```
 FastTyper/
 ├── backend/
-│   ├── fasttyper.service    # Systemd user service unit
-│   ├── setup.sh             # Model download & Vulkan llama.cpp build
-│   ├── eval-corpus.sh       # Regression & latency evaluation script
+│   ├── fasttyper.service    # Systemd user service unit (parameterized)
+│   ├── run-daemon.sh        # Standalone daemon runner for non-systemd setups
+│   ├── config.example       # Example daemon configuration template
+│   ├── setup.sh             # Scoped llama-server build & model download
+│   ├── eval-corpus.sh       # Streamlined regression & latency evaluation script
+│   ├── eval_worker.py       # Standalone evaluation worker
 │   └── corpus.txt           # Eval benchmark dataset
 ├── obsidian-plugin/
 │   ├── src/main.ts          # Core CM6 plugin logic & settings
 │   ├── styles.css           # Applied & processing underlines
-│   └── wordlist.json        # Bundled ~275k dictionary for Auto mode
+│   └── esbuild.config.mjs   # Bundler embedding compressed offline dictionary
 ├── browser-extension/
 │   ├── src/shared.ts        # Shared diff, mask, and prompt engine
-│   ├── src/background.ts    # Service worker & daemon HTTP bridge
-│   ├── src/content.ts       # DOM input watcher, caret mapper & UI
+│   ├── src/background.ts    # Background script & localhost HTTP bridge
+│   ├── src/content.ts       # DOM input watcher, caret mapper & Shadow DOM UI
 │   ├── src/popup.ts         # Toolbar popup controls & settings
-│   └── wordlist.json        # Bundled dictionary for extension Auto mode
+│   ├── build.mjs            # esbuild build script
+│   └── manifest.json        # Manifest V3 extension configuration
 └── AGENTS.md                # Architecture, engine rules, & developer notes
 ```
 
 ---
 
-## Privacy
+## License
 
-FastTyper is 100% local. No telemetry, no cloud APIs, no external network requests. All inference is processed directly on your local GPU daemon.
+This project is licensed under the [MIT License](LICENSE).

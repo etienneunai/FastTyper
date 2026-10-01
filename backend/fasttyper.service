@@ -1,34 +1,22 @@
 [Unit]
-Description=FastTyper Grammar Daemon (Llama Server Vulkan)
+Description=FastTyper Grammar Daemon (Llama Server)
 After=network.target
 
 [Service]
 Type=simple
 Environment="PORT=8808"
 Environment="HOST=127.0.0.1"
-Environment="VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/radeon_icd.json"
-Environment="AMD_VULKAN_ASYNC_COMPUTE=1"
+Environment="MODEL=%h/.local/share/models/dyslexic-writer-qwen3-4b-q4_k_m.gguf"
+Environment="N_GPU_LAYERS=99"
+Environment="CTX_SIZE=2048"
+Environment="THREADS=4"
+Environment="EXTRA_ARGS=-cb --reasoning off"
+Environment="LLAMA_SERVER_BIN=%h/.local/bin/llama-server"
 EnvironmentFile=-%h/.config/fasttyper/config
 EnvironmentFile=-/etc/fasttyper/config
-# -ngl 99: Offload all layers
-# -cb: Continuous batching
-# --split-mode none: Optimal for UMA iGPUs
-# -c 2048: Cap context (model default is 32k, wasteful on shared-memory iGPU)
-# --reasoning off: Force-disable Qwen3 thinking mode (equivalent to template
-#   enable_thinking=false, which emits an empty <think></think> marker). Qwen3
-#   thinks by default and decides per prompt — the "proofreader"/"cleaner"
-#   presets burn the whole max_tokens budget on reasoning_content and return
-#   empty output (see llm-log.txt). This makes the model answer directly.
-ExecStart=/usr/local/bin/llama-server \
-  -m %h/.local/share/models/dyslexic-writer-qwen3-4b-q4_k_m.gguf \
-  --port $PORT \
-  --host $HOST \
-  -ngl 99 \
-  -cb \
-  --split-mode none \
-  -c 2048 \
-  --reasoning off \
-  --threads 4
+
+# If LLAMA_SERVER_BIN is not at specified path, fallback search ~/.local/bin, /usr/local/bin, and PATH
+ExecStart=/bin/sh -c 'BIN="$LLAMA_SERVER_BIN"; if [ ! -x "$BIN" ]; then if [ -x "%h/.local/bin/llama-server" ]; then BIN="%h/.local/bin/llama-server"; elif [ -x "/usr/local/bin/llama-server" ]; then BIN="/usr/local/bin/llama-server"; else BIN="$(command -v llama-server || echo "$LLAMA_SERVER_BIN")"; fi; fi; exec "$BIN" -m "$MODEL" --port "$PORT" --host "$HOST" -ngl "$N_GPU_LAYERS" -c "$CTX_SIZE" --threads "$THREADS" $EXTRA_ARGS'
 Restart=always
 RestartSec=3
 

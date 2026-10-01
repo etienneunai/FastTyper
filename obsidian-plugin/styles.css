@@ -1,7 +1,7 @@
 .grammar-applied-underline {
-    text-decoration: underline wavy #3b82f6;
+    text-decoration: underline wavy var(--text-accent, #3b82f6);
     text-decoration-skip-ink: none;
-    background-color: rgba(59, 130, 246, 0.1);
+    background-color: var(--background-modifier-accent, rgba(59, 130, 246, 0.1));
 }
 
 .grammar-deletion-marker {
@@ -10,7 +10,7 @@
     height: 0.9em;
     margin: 0 1px;
     vertical-align: baseline;
-    background-color: #3b82f6;
+    background-color: var(--text-accent, #3b82f6);
     opacity: 0.6;
     border-radius: 1px;
 }
@@ -18,9 +18,9 @@
 /* In-flight indicator: the unit currently being corrected (amber, distinct from
    the blue applied `.grammar-applied-underline`). Pulses while thinking. */
 .ft-processing {
-    text-decoration: underline wavy #f59e0b;
+    text-decoration: underline wavy var(--text-warning, #f59e0b);
     text-decoration-skip-ink: none;
-    background-color: rgba(245, 158, 11, 0.12);
+    background-color: var(--background-modifier-warning, rgba(245, 158, 11, 0.12));
 }
 
 .ft-processing-thinking {
@@ -30,4 +30,28 @@
 @keyframes ft-processing-pulse {
     0%, 100% { opacity: 0.35; }
     50% { opacity: 1; }
+}
+
+/* Hover suggestion tooltip */
+.grammar-suggestion-tooltip {
+    cursor: pointer;
+    padding: 6px 10px;
+    border: 1px solid var(--background-modifier-border);
+    background-color: var(--background-secondary);
+    border-radius: 5px;
+    color: var(--text-normal);
+    font-size: var(--font-ui-smaller);
+    max-width: 360px;
+    box-shadow: var(--shadow-s, 0 2px 8px rgba(0, 0, 0, 0.15));
+}
+
+.grammar-suggestion-snippet {
+    font-weight: bold;
+    color: var(--text-accent);
+}
+
+.grammar-suggestion-hint {
+    opacity: 0.55;
+    margin-left: 6px;
+    font-weight: normal;
 }

@@ -2,6 +2,7 @@
 obsidian-plugin/node_modules/
 obsidian-plugin/main.js
 obsidian-plugin/wordlist.json
+obsidian-plugin/src/wordlist-compressed.ts
 browser-extension/node_modules/
 browser-extension/dist/
 backend/build/

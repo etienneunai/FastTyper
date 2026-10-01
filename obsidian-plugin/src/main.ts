@@ -1,6 +1,7 @@
-import { App, MarkdownView, Notice, Plugin, PluginSettingTab, Setting, requestUrl } from 'obsidian';
+import { App, MarkdownView, Notice, Plugin, PluginSettingTab, Setting, debounce } from 'obsidian';
 import { StateField, StateEffect, Transaction, ChangeSet, type Range, type Text } from '@codemirror/state';
 import { Decoration, DecorationSet, EditorView, ViewPlugin, ViewUpdate, hoverTooltip, WidgetType } from '@codemirror/view';
+import { GZIPPED_WORDLIST_B64 } from './wordlist-compressed';
 
 interface AppliedCorrection {
     from: number;
@@ -16,9 +17,20 @@ interface DiffHunk {
     replacement: string;
 }
 
-let LLM_URL = "http://127.0.0.1:8808/v1/chat/completions";
 let LLM_BASE = "http://127.0.0.1:8808";
+let LLM_URL = `${LLM_BASE}/v1/chat/completions`;
 let MODEL = "dyslexic-writer-qwen3-4b-q4_k_m.gguf";
+
+/** Sanitize LLM Base URL and update derived endpoints */
+function setLlmBaseUrl(url: string) {
+    let clean = url.trim().replace(/\/+$/, "");
+    if (!clean.startsWith("http://") && !clean.startsWith("https://")) {
+        clean = "http://" + clean;
+    }
+    LLM_BASE = clean;
+    LLM_URL = `${LLM_BASE}/v1/chat/completions`;
+}
+
 /** Wait after a trigger char insertion to make sure the user didn't delete it. */
 const TRIGGER_VERIFY_MS = 100;
 /** Skip units longer than this (sentences are short; keeps the 4B model's latency sane). */
@@ -71,18 +83,17 @@ const LLM_LOG_PATH = "FastTyper-LLM-Log.md";
 let loggingEnabled = false;
 
 /** Common abbreviations whose trailing period is not a sentence end. */
-const ABBREVIATIONS = new Set(["e.g.", "i.e.", "etc.", "Mr.", "Mrs.", "Ms.", "Dr.", "St.", "vs.", "no."]);
+const ABBREVIATIONS = new Set(["e.g.", "i.e.", "etc.", "Mr.", "Mrs.", "Ms.", "Dr.", "St.", "vs.", "no.", "Inc.", "Jr.", "Sr.", "Prof."]);
+
+/** Track daemon reachability notice to prevent spamming */
+let daemonOfflineNoticeShown = false;
 
 /**
- * Append one exchange to LLM_LOG_PATH as markdown. Gated by the "Log LLM
- * exchanges" settings toggle (default off), so the published build ships with
- * logging inactive but re-enablable in Settings — no source edit needed. Uses
- * the vault adapter (sanctioned API; no node 'fs'), so it works everywhere.
+ * Append one exchange to LLM_LOG_PATH as markdown.
  */
-function logExchange(sent: string, received: string): void {
+function logExchange(app: App, sent: string, received: string): void {
     if (!loggingEnabled) return;
     try {
-        const app = (window as unknown as { app?: App }).app;
         if (!app?.vault?.adapter) return;
         const ts = new Date().toISOString();
         const entry = `\n## ${ts}\n\n**sent**\n\n\`\`\`text\n${sent}\n\`\`\`\n\n**received**\n\n\`\`\`json\n${received}\n\`\`\`\n`;
@@ -108,10 +119,9 @@ let customSystem = PROMPT_PRESETS[0].system;
 /** Custom user-message template with `{text}` (used when `promptId === CUSTOM_PROMPT_ID`). */
 let customUser = PROMPT_PRESETS[0].user;
 /**
- * Thinking mode: "fast" = flat inference only (current behavior); "auto" = flat
- * first, escalate once to E + thinking only if flat changes nothing; "always" =
- * E + thinking on every request. (Thinking = E preset + enable_thinking + a
- * reasoning_budget_tokens cap — see `request()`.)
+ * Thinking mode: "fast" = flat inference only; "auto" = flat first,
+ * escalate once to E + thinking only if flat changes nothing or leaves suspect tokens;
+ * "always" = E + thinking on every request.
  */
 let thinkingMode: "fast" | "auto" | "always" = "auto";
 
@@ -188,8 +198,6 @@ export const setProcessing = StateEffect.define<{ from: number; to: number; thin
 /**
  * Amber underline over the unit while its correction request is in flight.
  * Pulses while the thinking pass is active (`.ft-processing-thinking`).
- * The stored span is mapped through every change so the underline tracks the
- * text while the user keeps typing; it collapses to null if the unit is deleted.
  */
 export const processingField = StateField.define<{ from: number; to: number; thinking: boolean } | null>({
     create() {
@@ -202,7 +210,7 @@ export const processingField = StateField.define<{ from: number; to: number; thi
                 to: tr.changes.mapPos(state.to, -1),
                 thinking: state.thinking
             };
-            if (state.from >= state.to) state = null; // unit deleted/collapsed mid-flight
+            if (state.from >= state.to) state = null;
         }
         for (const e of tr.effects) {
             if (e.is(setProcessing)) {
@@ -226,7 +234,7 @@ const CONTEXT_CHARS = 10;
 function contextSnippet(doc: Text, from: number, to: number, original: string, replacement: string): string {
     const before = doc.sliceString(Math.max(0, from - CONTEXT_CHARS), from);
     const after = doc.sliceString(to, Math.min(doc.length, to + CONTEXT_CHARS));
-    const core = original || replacement; // insertions have no original; show the added text
+    const core = original || replacement;
     const leftWs = before.match(/\s*$/)?.[0] ?? "";
     const rightWs = after.match(/^\s*/)?.[0] ?? "";
     const bText = before.slice(0, before.length - leftWs.length);
@@ -261,26 +269,16 @@ export const grammarTooltip = hoverTooltip((view, pos, side) => {
         above: true,
         create(view) {
             const c = found as AppliedCorrection;
-            let dom = document.createElement("div");
+            const dom = document.createElement("div");
             dom.className = "grammar-suggestion-tooltip";
-            dom.style.cursor = "pointer";
-            dom.style.padding = "6px 10px";
-            dom.style.border = "1px solid var(--background-modifier-border)";
-            dom.style.backgroundColor = "var(--background-secondary)";
-            dom.style.borderRadius = "5px";
-            dom.style.color = "var(--text-normal)";
-            dom.style.fontSize = "var(--font-ui-smaller)";
-            dom.style.maxWidth = "360px";
 
             const snippet = document.createElement("span");
-            snippet.style.fontWeight = "bold";
-            snippet.style.color = "var(--text-accent)";
-            snippet.textContent = contextSnippet(view.state.doc, c.from, c.to, c.originalText, c.replacement);
+            snippet.className = "grammar-suggestion-snippet";
+            // Use dynamically mapped coordinates decoFrom/decoTo to avoid stale offset extraction
+            snippet.textContent = contextSnippet(view.state.doc, decoFrom, decoTo, c.originalText, c.replacement);
 
             const hint = document.createElement("span");
-            hint.style.opacity = "0.55";
-            hint.style.marginLeft = "6px";
-            hint.style.fontWeight = "normal";
+            hint.className = "grammar-suggestion-hint";
             hint.textContent = "click to revert";
 
             dom.appendChild(snippet);
@@ -303,8 +301,6 @@ export const grammarTooltip = hoverTooltip((view, pos, side) => {
 // Response parsing + diff (dependency-free)
 // ---------------------------------------------------------------------------
 
-/** Strip Qwen3 `<think>` blocks (and any unclosed tail) and tidy the reply. */
-
 const MARKDOWN_REGEX = /```[\s\S]*?```|`[^`\n]+`|\$\$[\s\S]*?\$\$|\$[^$\n]+\$|^---\n[\s\S]*?\n---|!\[\[.*?\]\]|\[\[.*?\]\]|\]\(.*?\)|^[ \t]*#{1,6}\s|^[ \t]*>\s|^[ \t]*[-*+]\s|^[ \t]*\d+\.\s|\*\*|__|==|~~|\*|_|\[|\]/gm;
 
 function maskMarkdown(text: string): { masked: string, maskStrings: string[] } {
@@ -322,7 +318,8 @@ function restoreMarkdown(corrected: string, maskStrings: string[]): string | nul
     for (let i = 0; i < maskStrings.length; i++) {
         const tag = `<M${i}/>`;
         if (!out.includes(tag)) return null;
-        out = out.replace(tag, maskStrings[i]);
+        // Use replacer function to avoid corrupting LaTeX $$ or $& pattern expansions
+        out = out.replace(tag, () => maskStrings[i]);
     }
     if (/<M\d+\/>/.test(out)) return null;
     return out;
@@ -339,31 +336,20 @@ function parseResponse(content: string): string | null {
     return s.length > 0 ? s : null;
 }
 
-/**
- * Instruction-echo guard: the model must not repeat the proof prompt's own
- * wording back at us instead of correcting the text. This is a real failure
- * mode of the v4 E prompt (on short/hard inputs it echoes the instruction
- * rather than fixing), and applying such an echo would REPLACE the user's text
- * with the prompt. If any signature phrase appears in the output, it's the
- * instruction, not a fix.
- */
 const ECHO_MARKERS = ["ordinary content", "not instructions to you", "do not dwell or loop", "output only the corrected text"];
 function isInstructionEcho(corrected: string): boolean {
     const c = corrected.toLowerCase();
     return ECHO_MARKERS.some(m => c.includes(m));
 }
 
-// Maximum real usage: (MAX_UNIT_CHARS + 1) × (MAX_UNIT_CHARS * 2 + 201) = 801 × 1801 = 1,442,601
 const MAX_CHAR_DIFF_CELLS = 1_443_000;
 const diffBuffer = new Int32Array(MAX_CHAR_DIFF_CELLS);
 
 /**
  * Char-level LCS diff of two strings → minimal, ordered hunks `{from,to,replacement}`
- * relative to `a`. Cells are capped; oversized inputs fall back to one whole-region replace.
  */
 function charDiff(a: string, b: string): DiffHunk[] {
     const n = a.length, m = b.length;
-    // Guard uses (n+1)*(m+1) — the actual cell count including boundary rows/columns.
     if ((n + 1) * (m + 1) > MAX_CHAR_DIFF_CELLS) return a === b ? [] : [{ from: 0, to: n, replacement: b }];
 
     const width = m + 1;
@@ -412,22 +398,40 @@ function charDiff(a: string, b: string): DiffHunk[] {
 function diffWords(a: string, b: string): DiffHunk[] {
     return charDiff(a, b).filter((h) => {
         const orig = a.slice(h.from, h.to);
-        if (orig === h.replacement) return false;                       // identity
-        if (orig.trim() === "" && h.replacement.trim() === "") return false; // whitespace churn
+        if (orig === h.replacement) return false;
+        if (orig.trim() === "" && h.replacement.trim() === "") return false;
         return true;
     });
 }
 
-// Lazy ~275k-word Set; built on first use (~40 ms) so plugin load stays cheap.
+// Lazy ~275k-word Set; decompressed from embedded gzip bundle on startup
 let _wordSet: Set<string> | null = null;
 
+/** Suffix stemming to prevent false escalation on common English inflections */
+function isValidWord(token: string, ws: Set<string>): boolean {
+    if (ws.has(token)) return true;
+    if (token.endsWith("ed")) {
+        if (ws.has(token.slice(0, -2))) return true; // spellchecked -> spellcheck
+        if (ws.has(token.slice(0, -1))) return true; // baked -> bake
+        if (token.length > 4 && token[token.length - 3] === token[token.length - 4] && ws.has(token.slice(0, -3))) return true; // stopped -> stop
+    }
+    if (token.endsWith("ing")) {
+        if (ws.has(token.slice(0, -3))) return true; // spelling -> spell
+        if (ws.has(token.slice(0, -3) + "e")) return true; // dancing -> dance
+        if (token.length > 5 && token[token.length - 4] === token[token.length - 5] && ws.has(token.slice(0, -4))) return true; // running -> run
+    }
+    if (token.endsWith("s")) {
+        if (ws.has(token.slice(0, -1))) return true; // words -> word
+        if (token.endsWith("es") && ws.has(token.slice(0, -2))) return true; // boxes -> box
+    }
+    if (token.endsWith("ly")) {
+        if (ws.has(token.slice(0, -2))) return true; // quickly -> quick
+    }
+    return false;
+}
+
 /**
- * True if `text` has a token that isn't a known English word. Runs only in Auto
- * mode after a flat correction, to decide whether to escalate to thinking.
- * Never flags: digit-bordered tokens ("v2"), any-uppercase tokens (proper nouns
- * + the capitalized sentence start), or apostrophe tokens (contractions — a plain
- * wordlist can't judge those). Lone lowercase "i" is a real typo for "I" and *is*
- * a dictionary word, so it's flagged explicitly.
+ * True if `text` has a token that isn't a known English word.
  */
 function hasSuspectTokens(text: string): boolean {
     if (_wordSet === null) return false;
@@ -436,11 +440,11 @@ function hasSuspectTokens(text: string): boolean {
     while ((m = re.exec(text)) !== null) {
         const raw = m[0];
         if (/\d/.test(text[m.index - 1] ?? "") || /\d/.test(text[m.index + raw.length] ?? "")) continue;
-        if (/[A-Z]/.test(raw)) continue;        // proper nouns + the capitalized sentence start
+        if (/[A-Z]/.test(raw)) continue;
         const token = raw.toLowerCase();
-        if (token.includes("'")) continue;      // don't, it's, James'
+        if (token.includes("'")) continue;
         if (token.length === 1) { if (token === "i") return true; continue; }
-        if (!_wordSet.has(token)) return true;
+        if (!isValidWord(token, _wordSet)) return true;
     }
     return false;
 }
@@ -460,19 +464,16 @@ const grammarCheckerPlugin = ViewPlugin.fromClass(class {
     queue: { from: number; to: number }[] = [];
     destroyed: boolean = false;
     paused: boolean = false;
-    /**
-     * Bumped on every halt. `fire()` records its value at start and checks it
-     * after each await: a halted fire's result is discarded and its `finally`
-     * won't clobber the shared state if a newer fire has started meanwhile.
-     */
+    pluginApp: App;
     fireSeq: number = 0;
 
     constructor(view: EditorView) {
         this.view = view;
         this.paused = correctionsPaused;
+        // Access app from plugin registry via view or active plugin instance
+        this.pluginApp = (window as unknown as { app?: App }).app as App;
     }
 
-    /** Pause/resume. Pausing drops queued work and aborts any in-flight request. */
     setPaused(paused: boolean) {
         this.paused = paused;
         if (paused) {
@@ -484,17 +485,9 @@ const grammarCheckerPlugin = ViewPlugin.fromClass(class {
         }
     }
 
-    /**
-     * Halt the current correction: discard the in-flight request (its result is
-     * never applied), drop queued + pending-trigger work, and clear the amber
-     * processing underline. Unlike pause, this doesn't block future triggers —
-     * the next sentence is corrected normally. Returns true if there was work to
-     * halt. (Obsidian's `requestUrl` carries no abort signal, so the daemon may
-     * finish the request, but the response is discarded.)
-     */
     halt(): boolean {
         const hadWork = this.isPending || this.verifyTimeout !== null || this.queue.length > 0;
-        this.fireSeq++; // invalidate any in-flight fire so its result is discarded
+        this.fireSeq++;
         if (this.verifyTimeout) { clearTimeout(this.verifyTimeout); this.verifyTimeout = null; }
         this.verifyPos = null;
         this.verifyChar = "";
@@ -515,7 +508,6 @@ const grammarCheckerPlugin = ViewPlugin.fromClass(class {
     }
 
     update(update: ViewUpdate) {
-        // Keep in-flight state in sync with whatever the user keeps typing.
         if (this.pending) {
             this.pending = { ...this.mapSpan(this.pending, update.changes), text: this.pending.text, lead: this.pending.lead };
         }
@@ -524,10 +516,6 @@ const grammarCheckerPlugin = ViewPlugin.fromClass(class {
 
         if (!update.docChanged) return;
 
-        // Ignore our own corrections/reverts so we don't re-trigger on them.
-        // (setProcessing is effect-only so `!update.docChanged` already short-circuits
-        // above — this is belt-and-suspenders in case a changes+setProcessing
-        // transaction ever fires.)
         const isAutoApply = update.transactions.some(tr => tr.effects.some(e => e.is(setCorrections) || e.is(revertCorrection) || e.is(clearCorrections) || e.is(setProcessing)));
         if (isAutoApply) return;
         if (this.paused) return;
@@ -538,10 +526,6 @@ const grammarCheckerPlugin = ViewPlugin.fromClass(class {
         if (this.verifyTimeout) {
             clearTimeout(this.verifyTimeout);
             this.verifyTimeout = null;
-            // A new trigger landed before the old one confirmed. The old trigger
-            // char is still present (this keystroke inserted, didn't delete), so
-            // confirm it NOW instead of losing the completed unit — otherwise
-            // pressing Enter twice to end a paragraph drops the first line.
             this.confirmTrigger();
         }
         this.verifyPos = trig.pos;
@@ -549,28 +533,14 @@ const grammarCheckerPlugin = ViewPlugin.fromClass(class {
         this.verifyTimeout = setTimeout(() => this.confirmTrigger(), TRIGGER_VERIFY_MS);
     }
 
-    /** Last pure insertion of `.`/`?`/`!`/`\n` across the update's transactions. */
     private findTrigger(update: ViewUpdate): { pos: number; ch: string } | null {
         for (let t = update.transactions.length - 1; t >= 0; t--) {
             let found: { pos: number; ch: string } | null = null;
             update.transactions[t].changes.iterChanges((fromA, toA, fromB, toB, inserted) => {
                 const s = inserted.toString();
-                // Only count pure insertions for punctuation triggers, but always
-                // count an inserted line break — Obsidian's list continuation
-                // (Enter at a bullet) lands as a replacement transaction like
-                // "y\n- " (fromA !== toA), which would otherwise never fire the
-                // newline trigger.
                 if (fromA !== toA && !s.includes('\n')) return;
                 for (let k = s.length - 1; k >= 0; k--) {
                     const c = s[k];
-                    // A "." that is a list-marker dot ("5." in a numbered item) is
-                    // not a sentence end. Skip it so a numbered-list continuation
-                    // transaction ("\n5. ") still resolves to the "\n" — exactly
-                    // like a bullet continuation ("\n- "). Without this, the "."
-                    // is the rightmost trigger char and fires a punctuation
-                    // trigger on the 2-char marker, which MIN_UNIT_CHARS drops.
-                    // Guard with includes('\n') so a paste ending in e.g. "42."
-                    // (no newline) still fires the "." trigger normally.
                     if (c === '.' && /\d/.test(s[k - 1] ?? "") && /\s/.test(s[k + 1] ?? "") && s.includes('\n')) {
                         continue;
                     }
@@ -585,7 +555,6 @@ const grammarCheckerPlugin = ViewPlugin.fromClass(class {
         return null;
     }
 
-    /** Called TRIGGER_VERIFY_MS after the trigger char — confirm it survived, then fire. */
     private confirmTrigger() {
         if (this.destroyed || this.paused || this.verifyPos === null) return;
         const pos = this.verifyPos;
@@ -598,8 +567,6 @@ const grammarCheckerPlugin = ViewPlugin.fromClass(class {
             return;
         }
 
-        // "." only counts as a sentence end if followed by whitespace/EOL/a closer
-        // (rejects "3.14", "v1.2.3") and not an abbreviation ("e.g.", "Mr.").
         if (ch === '.') {
             const next = pos + 1 < doc.length ? doc.sliceString(pos + 1, pos + 2) : "";
             if (next !== "" && !/\s/.test(next) && !"\"')]}".includes(next)) return;
@@ -607,11 +574,6 @@ const grammarCheckerPlugin = ViewPlugin.fromClass(class {
             if (prev && ABBREVIATIONS.has(prev)) return;
         }
 
-        // A newline must not re-trigger a line whose terminating punctuation
-        // already fired the sentence trigger (avoids double-processing a line
-        // that ends with . ? !). Reuse the same abbreviation rule: "e.g." does
-        // NOT count, so a line ending in an abbreviation still falls through to
-        // the newline (line) trigger.
         if (ch === '\n') {
             if (pos <= 0) return;
             const line = doc.lineAt(pos - 1);
@@ -638,13 +600,6 @@ const grammarCheckerPlugin = ViewPlugin.fromClass(class {
         this.maybeFire();
     }
 
-    /**
-     * Expand `head` to the surrounding paragraph block (blank-line or heading
-     * delimited). A `# heading` line must end the block in both directions: the
-     * model strips heading lines from its output, so pulling one into a unit lets
-     * the diff commit its deletion. (The user's notes were losing `# Overview`
-     * lines this way.)
-     */
     private paragraphRange(head: number): { from: number; to: number } {
         const doc = this.view.state.doc;
         const line = doc.lineAt(head);
@@ -663,14 +618,12 @@ const grammarCheckerPlugin = ViewPlugin.fromClass(class {
         return { from, to };
     }
 
-    /** The sentence ending at `triggerPos` (the position of `.`/`?`/`!`). */
     private sentenceSpan(triggerPos: number): { from: number; to: number } | null {
         const doc = this.view.state.doc;
         const para = this.paragraphRange(triggerPos);
         const paraText = doc.sliceString(para.from, para.to);
         const offset = para.from;
 
-        // Walk back over the punctuation cluster that includes the trigger ("...", "?!").
         let clusterStart = triggerPos;
         while (clusterStart > para.from) {
             const c = paraText[clusterStart - 1 - offset];
@@ -678,24 +631,38 @@ const grammarCheckerPlugin = ViewPlugin.fromClass(class {
             clusterStart--;
         }
 
-        // A bullet point is a sentence delimiter: a `.`/`?`/`!` at the end of a
-        // list item must not swallow the whole list. Clamp the scan-back to the
-        // current line's start when that line is a list item, so the unit is just
-        // the one bullet (matching the newline trigger's per-line capture).
         const line = doc.lineAt(triggerPos);
         const hardStop = this.isListMarkerLine(line.text) ? line.from : para.from;
 
-        // Scan back to the previous sentence terminator (or the hard stop).
         let from = hardStop;
         for (let i = clusterStart - 1; i >= hardStop; i--) {
             const c = paraText[i - offset];
-            if (c === '.' || c === '?' || c === '!') {
+            if (c === '?' || c === '!') {
+                from = i + 1;
+                break;
+            }
+            if (c === '.') {
+                // Skip ellipsis dots (e.g. "...")
+                if ((i > hardStop && paraText[i - 1 - offset] === '.') ||
+                    (i < clusterStart - 1 && paraText[i + 1 - offset] === '.')) {
+                    continue;
+                }
+                // Skip decimals (e.g. "3.50", "$3.50")
+                const prevChar = i > hardStop ? paraText[i - 1 - offset] : '';
+                const nextChar = i < clusterStart - 1 ? paraText[i + 1 - offset] : '';
+                if (/\d/.test(prevChar) && /\d/.test(nextChar)) {
+                    continue;
+                }
+                // Skip abbreviations (e.g. "Dr.", "e.g.", "Mr.")
+                const prevTok = this.prevToken(i);
+                if (prevTok && ABBREVIATIONS.has(prevTok)) {
+                    continue;
+                }
                 from = i + 1;
                 break;
             }
         }
 
-        // Include any trailing closers after the trigger.
         let to = triggerPos + 1;
         while (to < para.to) {
             const c = paraText[to - offset];
@@ -706,18 +673,15 @@ const grammarCheckerPlugin = ViewPlugin.fromClass(class {
         return { from, to };
     }
 
-    /** True if the line begins a list item ("- ", "* ", "+ ", "1. ", "1) ", "[ ] "). */
     private isListMarkerLine(lineText: string): boolean {
         const t = lineText.trimStart();
         return /^[-*+]\s/.test(t) || /^\d+[.)]\s/.test(t) || /^\[[ xX\-]\]\s/.test(t);
     }
 
-    /** True if the line is an ATX Markdown heading (`#`, `##`, … up to 6, ≤3 lead spaces). */
     private isHeadingLine(lineText: string): boolean {
         return /^[ ]{0,3}#{1,6}(?:\s|$)/.test(lineText);
     }
 
-    /** The line completed by the newline at `triggerPos`. */
     private lineSpan(triggerPos: number): { from: number; to: number } | null {
         const doc = this.view.state.doc;
         if (triggerPos <= 0) return null;
@@ -726,7 +690,6 @@ const grammarCheckerPlugin = ViewPlugin.fromClass(class {
         return { from: line.from, to: line.to };
     }
 
-    /** Whitespace-delimited token immediately before `pos` (including a trailing period). */
     private prevToken(pos: number): string {
         const doc = this.view.state.doc;
         if (pos <= 0) return "";
@@ -742,28 +705,20 @@ const grammarCheckerPlugin = ViewPlugin.fromClass(class {
         return lineText.slice(start, relPos + 1);
     }
 
-    
-
-
-
-    /** Map a span forward through a change set (keeps it accurate while the user types). */
     private mapSpan(span: { from: number; to: number }, changes: ChangeSet): { from: number; to: number } {
         return { from: changes.mapPos(span.from, 1), to: changes.mapPos(span.to, -1) };
     }
 
-    /** If no request is in flight and something is queued, start it. */
     private maybeFire() {
         if (this.isPending || this.paused || this.queue.length === 0) return;
         const span = this.queue.shift()!;
         this.fire(span);
     }
 
-    /** Correct `span`, re-sending (≤MAX_RETRIES) if the text changes while we wait. */
     private async fire(span: { from: number; to: number }) {
         this.isPending = true;
         const mySeq = this.fireSeq;
         this.pending = { from: span.from, to: span.to, text: "", lead: 0 };
-        // "auto" starts flat and escalates once (below) if flat changes nothing.
         let thinking = thinkingMode === "always";
         this.markProcessing(thinking);
         try {
@@ -772,7 +727,7 @@ const grammarCheckerPlugin = ViewPlugin.fromClass(class {
                 const text = raw.trim();
                 const lead = raw.length - raw.trimStart().length;
                 if (text.length < MIN_UNIT_CHARS) return;
-                
+
                 let leadingPrefix = '';
                 const prefixMatch = text.match(/^([ \t]*>[ \t]+|[ \t]*[-*+][ \t]+\[[ xX\-]\][ \t]+|[ \t]*\[[ xX\-]\][ \t]+|[ \t]*[-*+][ \t]+|[ \t]*\d+\.[ \t]+|[ \t]*#{1,6}[ \t]+)/);
                 if (prefixMatch) {
@@ -793,22 +748,26 @@ const grammarCheckerPlugin = ViewPlugin.fromClass(class {
                     correctedMasked = await this.request(payloadText, masked, controller.signal, thinking);
                 } catch (e: any) {
                     if (e?.name !== 'AbortError') {
-                        console.error("FastTyper: grammar request failed", e);
+                        if (!daemonOfflineNoticeShown) {
+                            daemonOfflineNoticeShown = true;
+                            new Notice(`FastTyper: daemon unreachable at ${LLM_BASE}. Check that llama-server is running.`);
+                        }
                     }
                     return;
                 }
                 if (this.destroyed || this.paused || this.fireSeq !== mySeq || this.abortController !== controller) return;
                 this.abortController = null;
 
-                if (!correctedMasked) return; // nothing usable from the model
+                if (!correctedMasked) return;
                 const rawRestored = restoreMarkdown(correctedMasked, maskStrings);
                 if (!rawRestored) return;
-                
-                let corrected = leadingPrefix + rawRestored;
+
+                // Fix prefix-induced capitalization bug: Capitalize initial char of rawRestored FIRST, then prepend prefix
+                const capitalizedRestored = this.capitalizeInitial(rawRestored);
+                const corrected = leadingPrefix + capitalizedRestored;
                 if (corrected.length > text.length * 2 + 200) return;
 
-                const rawCorrected = corrected;           // model output, pre-capitalize
-                corrected = this.capitalizeInitial(rawCorrected);
+                const rawCorrected = leadingPrefix + rawRestored;
                 const noOp = rawCorrected === text;
 
                 if (thinkingMode === "auto" && !thinking) {
@@ -819,14 +778,13 @@ const grammarCheckerPlugin = ViewPlugin.fromClass(class {
                     if (noOp ? suspects : leftover) {
                         thinking = true;
                         this.markProcessing(true);
-                        continue; // thinking pass sees the ORIGINAL text
+                        continue;
                     }
                 }
-                if (noOp && corrected === text) return; // no change at all — nothing to apply
+                if (noOp && corrected === text) return;
 
                 const nowText = this.view.state.doc.sliceString(this.pending.from, this.pending.to).trim();
                 if (nowText !== text) {
-                    // The user edited the unit while we waited — resend with the new text.
                     if (retries < MAX_RETRIES) continue;
                     return;
                 }
@@ -836,9 +794,6 @@ const grammarCheckerPlugin = ViewPlugin.fromClass(class {
                 return;
             }
         } finally {
-            // Only the current fire resets the shared state — a halted fire that
-            // resolves after a newer one started must not clobber it (halt()
-            // already reset everything it needs to).
             if (this.fireSeq === mySeq) {
                 if (!this.destroyed) this.view.dispatch({ effects: setProcessing.of(null) });
                 this.isPending = false;
@@ -849,12 +804,6 @@ const grammarCheckerPlugin = ViewPlugin.fromClass(class {
         }
     }
 
-    /**
-     * Mark the in-flight unit with the amber processing underline. Deferred via
-     * queueMicrotask: `fire()` can be reached synchronously from `update()` (the
-     * newline path confirmTrigger → maybeFire), and dispatching to the view while
-     * an update is in progress throws.
-     */
     private markProcessing(thinking: boolean) {
         if (!this.pending) return;
         queueMicrotask(() => {
@@ -863,7 +812,6 @@ const grammarCheckerPlugin = ViewPlugin.fromClass(class {
         });
     }
 
-    /** Capitalize the sentence-initial letter (lowercase a-z first char only), if enabled. */
     private capitalizeInitial(corrected: string): string {
         if (!capitalizeInitials || corrected.length === 0) return corrected;
         const c0 = corrected[0];
@@ -871,74 +819,53 @@ const grammarCheckerPlugin = ViewPlugin.fromClass(class {
         return corrected;
     }
 
-    /**
-     * POST the unit to the daemon and return the corrected text (or null).
-     * When `thinking` is true the request uses the E (proof) preset with Qwen3
-     * thinking enabled and a reasoning_budget_tokens cap — the config the eval
-     * matrix proved fixes the hard dyslexic cases (9/10) that flat inference
-     * leaves unchanged (6/10), at ~6–12 s instead of ~0.4 s.
-     */
     private async request(text: string, masked: string, signal: AbortSignal, thinking: boolean): Promise<string | null> {
         const prompt = thinking ? PROMPT_PRESETS.find(p => p.id === "E") ?? PROMPT_PRESETS[0] : activePrompt();
-        const payload = {
+        const payload: Record<string, any> = {
             model: MODEL,
             messages: [
                 { role: "system", content: prompt.system },
                 { role: "user", content: prompt.user.split("{text}").join(masked) }
             ],
             temperature: 0,
-            // Thinking needs headroom for the reasoning block; flat stays capped
-            // by text length. Never let a runaway thinking pass burn the whole
-            // budget and return empty (see reasoning_budget_tokens below).
             max_tokens: thinking ? 2048 : Math.min(2048, Math.ceil(masked.length / 3) + 256),
             chat_template_kwargs: { enable_thinking: thinking },
-            // Per-request reasoning cap: force-emits the end-of-thinking tag when
-            // exhausted, so the model can't burn max_tokens on reasoning_content
-            // and return an empty no-op (the eval's 91.6 s → 6–12 s fix).
             ...(thinking ? {
                 reasoning_budget_tokens: 256,
-                // Canonical Qwen3 "reasoning-frenzy" fix (Bug B): when the budget is
-                // exhausted, llama-server prepends this to the forced end-of-thinking
-                // tag, so a model fixated on one phrase is told to stop and answer.
-                // Top-level field, read by server-common.cpp:1344; needs llama-server
-                // >= b9982 (per-request field was silently ignored before PR #23116).
                 reasoning_budget_message: "Stop reasoning and answer now."
             } : {})
         };
 
-        const response = await requestUrl({
-            url: LLM_URL,
+        // Use window.fetch to support true AbortSignal cancellation on localhost
+        const response = await window.fetch(LLM_URL, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify(payload),
-            throw: false,
+            signal
         });
 
-        if (response.status !== 200) {
+        if (!response.ok) {
             console.error("FastTyper: daemon returned", response.status);
             return null;
         }
 
-        const data = response.json;
+        // On successful connection, reset unreachable notice flag
+        daemonOfflineNoticeShown = false;
+
+        const data = await response.json();
         if (!data?.choices?.[0]?.message?.content) {
             console.error("FastTyper: unparseable response");
             return null;
         }
 
         const content = data.choices[0].message.content;
-        // Log the raw message (incl. reasoning_content) before the guards below, so
-        // exchanges the guards reject are still visible while debugging.
-        logExchange(text, JSON.stringify(data.choices[0].message));
-        let corrected = parseResponse(content);
+        logExchange(this.pluginApp, text, JSON.stringify(data.choices[0].message));
+        const corrected = parseResponse(content);
         if (!corrected) return null;
-        // Echo guards: (1) the model must not repeat the instruction back (the v4
-        // proof prompt can echo on short/hard inputs — catastrophic, would replace
-        // the text with the prompt);
         if (isInstructionEcho(corrected)) return null;
         return corrected;
     }
 
-    /** Replace the diff hunks in the doc and decorate the changed spans. */
     private applyHunks(spanFrom: number, lead: number, hunks: DiffHunk[]) {
         const doc = this.view.state.doc;
         const changes = hunks.map(h => ({
@@ -952,7 +879,6 @@ const grammarCheckerPlugin = ViewPlugin.fromClass(class {
             const docFrom = spanFrom + lead + h.from;
             const docTo = spanFrom + lead + h.to;
             const originalText = doc.sliceString(docFrom, docTo);
-            // assoc -1: a pure insertion's mark must start AT the insertion point.
             const newFrom = changeSet.mapPos(docFrom, -1);
             const newTo = newFrom + h.replacement.length;
             return { from: newFrom, to: newTo, originalText, replacement: h.replacement };
@@ -980,12 +906,13 @@ class FastTyperSettingTab extends PluginSettingTab {
         const statusSetting = new Setting(containerEl)
             .setName("Daemon status")
             .setDesc("Checking connection...");
-        
+
         const checkStatus = async () => {
             try {
-                const res = await requestUrl({ url: `${LLM_BASE}/v1/models` });
-                if (res.status === 200) {
+                const res = await window.fetch(`${LLM_BASE}/v1/models`, { method: "GET" });
+                if (res.ok) {
                     statusSetting.setDesc("🟢 Connected to daemon");
+                    daemonOfflineNoticeShown = false;
                 } else {
                     statusSetting.setDesc(`🔴 Daemon error: HTTP ${res.status}`);
                 }
@@ -995,26 +922,33 @@ class FastTyperSettingTab extends PluginSettingTab {
         };
         checkStatus();
 
+        const debouncedSaveAndStatus = debounce(async (url: string) => {
+            setLlmBaseUrl(url);
+            await this.plugin.saveSettings();
+            await checkStatus();
+        }, 500, true);
+
         new Setting(containerEl)
             .setName("LLM Base URL")
             .setDesc("The base URL of the llama.cpp daemon.")
             .addText(text => text
                 .setValue(LLM_BASE)
-                .onChange(async (value) => {
-                    LLM_BASE = value;
-                    LLM_URL = `${value}/v1/chat/completions`;
-                    await this.plugin.saveSettings();
-                    checkStatus();
+                .onChange((value) => {
+                    debouncedSaveAndStatus(value);
                 }));
-        
+
+        const debouncedSaveModel = debounce(async (value: string) => {
+            MODEL = value.trim();
+            await this.plugin.saveSettings();
+        }, 500, true);
+
         new Setting(containerEl)
             .setName("Model Name")
             .setDesc("The exact filename or identifier of the loaded model.")
             .addText(text => text
                 .setValue(MODEL)
-                .onChange(async (value) => {
-                    MODEL = value;
-                    await this.plugin.saveSettings();
+                .onChange((value) => {
+                    debouncedSaveModel(value);
                 }));
 
         new Setting(containerEl)
@@ -1040,7 +974,7 @@ class FastTyperSettingTab extends PluginSettingTab {
 
         new Setting(containerEl)
             .setName("Correction prompt")
-            .setDesc("Which prompt to send the model. A — prod: the default, spelling-only, never corrupts correct text. B — gram: adds missing spaces and a/an, keeps A's safety and speed. E — proof: most capable (a/an, apostrophes, run-together) but slow — emits a ~340-token reasoning block per request (6–25 s). C — clean: fixes a/an and run-together but unreliable (empty outputs, mid-sentence truncation) — a correction risk. Custom: edit both messages.")
+            .setDesc("Which prompt to send the model. A — prod: default spelling-only. B — gram: adds missing spaces and a/an. E — proof: proofreader (slow thinking pass). C — clean: aggressive spacing. Custom: edit templates.")
             .addDropdown(drop => drop
                 .addOption("A", "A — prod")
                 .addOption("B", "B — gram")
@@ -1052,7 +986,7 @@ class FastTyperSettingTab extends PluginSettingTab {
 
         new Setting(containerEl)
             .setName("Thinking mode")
-            .setDesc("Auto — flat attempt first (~0.4 s); escalates once to E + thinking (~6–12 s) only if flat changes nothing or leaves misspelled-looking (non-dictionary) tokens. Always — E + thinking on every trigger. Fast — flat-only; leaves transposed/doubled-letter dyslexic typos unchanged (use Auto if you hit those). While correcting, the unit is underlined amber; it pulses while thinking.")
+            .setDesc("Auto — flat attempt first (~0.4 s); escalates once to E + thinking (~6–12 s) on no-op or suspect tokens. Always — E + thinking on every trigger. Fast — flat only.")
             .addDropdown(drop => drop
                 .addOption("fast", "Fast")
                 .addOption("auto", "Auto")
@@ -1061,20 +995,27 @@ class FastTyperSettingTab extends PluginSettingTab {
                 .onChange(value => this.plugin.setThinkingMode(value as "fast" | "auto" | "always")));
 
         if (promptId === CUSTOM_PROMPT_ID) {
+            const debouncedCustomSystem = debounce((value: string) => {
+                this.plugin.setCustomSystem(value);
+            }, 500, true);
+            const debouncedCustomUser = debounce((value: string) => {
+                this.plugin.setCustomUser(value);
+            }, 500, true);
+
             new Setting(containerEl)
                 .setName("Custom system prompt")
                 .setDesc("The system message sent with every request.")
                 .addTextArea(text => text
                     .setPlaceholder(PROMPT_PRESETS[0].system)
                     .setValue(customSystem)
-                    .onChange(value => this.plugin.setCustomSystem(value)));
+                    .onChange(value => debouncedCustomSystem(value)));
             new Setting(containerEl)
                 .setName("Custom user prompt")
                 .setDesc("The user-message template. {text} is replaced with the sentence/line to correct.")
                 .addTextArea(text => text
                     .setPlaceholder(PROMPT_PRESETS[0].user)
                     .setValue(customUser)
-                    .onChange(value => this.plugin.setCustomUser(value)));
+                    .onChange(value => debouncedCustomUser(value)));
         }
 
         new Setting(containerEl)
@@ -1087,7 +1028,7 @@ class FastTyperSettingTab extends PluginSettingTab {
 
         new Setting(containerEl)
             .setName("Halt current correction")
-            .setDesc("Discard the in-flight correction request — nothing is applied. Queued and pending-trigger units are dropped too. (Also a hotkey-bindable command: Settings → Hotkeys → 'FastTyper: Halt current correction'.)")
+            .setDesc("Discard the in-flight correction request — nothing is applied. (Hotkey-bindable: 'FastTyper: Halt current correction'.)")
             .addButton(button => button
                 .setButtonText("Halt")
                 .onClick(() => this.plugin.haltCurrent()));
@@ -1107,14 +1048,15 @@ export default class FastTyperPlugin extends Plugin {
         if (typeof data?.customSystem === "string") customSystem = data.customSystem;
         if (typeof data?.customUser === "string") customUser = data.customUser;
         if (data?.thinkingMode === "fast" || data?.thinkingMode === "auto" || data?.thinkingMode === "always") thinkingMode = data.thinkingMode;
-        if (typeof data?.llmUrl === "string") LLM_URL = data.llmUrl;
-        if (typeof data?.llmBase === "string") LLM_BASE = data.llmBase;
+        if (typeof data?.llmBase === "string") setLlmBaseUrl(data.llmBase);
+        else if (typeof data?.llmUrl === "string") {
+            const base = data.llmUrl.replace(/\/v1\/chat\/completions$/, "");
+            setLlmBaseUrl(base);
+        }
         if (typeof data?.model === "string") MODEL = data.model;
 
-        // Async load wordlist to prevent blocking startup
-        this.app.vault.adapter.read(`${this.manifest.dir}/wordlist.json`).then(
-            text => _wordSet = new Set(JSON.parse(text))
-        ).catch(e => console.error("FastTyper: failed to load wordlist", e));
+        // Decompress bundled offline wordlist asynchronously via DecompressionStream
+        this.initWordlist();
 
         this.addCommand({
             id: "accept-all-corrections",
@@ -1150,23 +1092,47 @@ export default class FastTyperPlugin extends Plugin {
             grammarCheckerPlugin
         ]);
 
-        // Editors already open need their ViewPlugin instances told about the
-        // loaded pause state (new ones pick it up in their constructor).
         this.applyPauseState();
+    }
+
+    private async initWordlist() {
+        if (GZIPPED_WORDLIST_B64) {
+            try {
+                const binary = atob(GZIPPED_WORDLIST_B64);
+                const bytes = new Uint8Array(binary.length);
+                for (let i = 0; i < binary.length; i++) {
+                    bytes[i] = binary.charCodeAt(i);
+                }
+                const ds = new DecompressionStream("gzip");
+                const writer = ds.writable.getWriter();
+                writer.write(bytes);
+                writer.close();
+                const text = await new Response(ds.readable).text();
+                _wordSet = new Set(JSON.parse(text));
+                return;
+            } catch (e) {
+                console.error("FastTyper: failed to decompress bundled wordlist, falling back to disk", e);
+            }
+        }
+        // Fallback to vault adapter read if available
+        try {
+            const text = await this.app.vault.adapter.read(`${this.manifest.dir}/wordlist.json`);
+            _wordSet = new Set(JSON.parse(text));
+        } catch (e) {
+            console.error("FastTyper: failed to load wordlist from disk", e);
+        }
     }
 
     onunload() {
         console.log('Unloading FastTyper plugin');
     }
 
-    /** Commit every applied correction: clears all underline decorations. */
     acceptAll() {
         const cv = this.activeCm();
         if (!cv) return;
         cv.dispatch({ effects: clearCorrections.of(null) });
     }
 
-    /** Discard the active editor's in-flight/queued corrections (nothing is applied). */
     haltCurrent() {
         const cv = this.activeCm();
         if (!cv) return;
@@ -1174,7 +1140,6 @@ export default class FastTyperPlugin extends Plugin {
         if (halted) new Notice("FastTyper: correction halted");
     }
 
-    /** Toggle corrections on/off across all open editors and persist the choice. */
     async setPaused(paused: boolean) {
         correctionsPaused = paused;
         await this.saveSettings();
@@ -1183,28 +1148,24 @@ export default class FastTyperPlugin extends Plugin {
         new Notice(paused ? "FastTyper: corrections paused" : "FastTyper: corrections resumed");
     }
 
-    /** Toggle sentence-initial capitalization and persist. */
     async setCapitalizeInitials(value: boolean) {
         capitalizeInitials = value;
         await this.saveSettings();
         this.settingsTab?.display();
     }
 
-    /** Toggle LLM exchange logging to the vault note and persist. */
     async setLoggingEnabled(value: boolean) {
         loggingEnabled = value;
         await this.saveSettings();
         this.settingsTab?.display();
     }
 
-    /** Select the active prompt preset (`A`/`B`/`E`/`C`/`custom`) and persist. */
     async setPromptId(id: string) {
         promptId = id;
         await this.saveSettings();
         this.settingsTab?.display();
     }
 
-    /** Select the thinking mode (`fast`/`auto`/`always`) and persist. */
     async setThinkingMode(mode: "fast" | "auto" | "always") {
         thinkingMode = mode;
         await this.saveSettings();
@@ -1212,24 +1173,31 @@ export default class FastTyperPlugin extends Plugin {
         new Notice(`FastTyper: thinking mode = ${mode}`);
     }
 
-    /** Set the custom system message (used with the Custom prompt) and persist. */
     async setCustomSystem(value: string) {
         customSystem = value;
         await this.saveSettings();
     }
 
-    /** Set the custom user template (used with the Custom prompt) and persist. */
     async setCustomUser(value: string) {
         customUser = value;
         await this.saveSettings();
     }
 
-    /** Persist the current settings to plugin data. */
     async saveSettings() {
-        await this.saveData({ paused: correctionsPaused, capitalizeInitials, loggingEnabled, promptId, customSystem, customUser, thinkingMode, llmUrl: LLM_URL, llmBase: LLM_BASE, model: MODEL });
+        await this.saveData({
+            paused: correctionsPaused,
+            capitalizeInitials,
+            loggingEnabled,
+            promptId,
+            customSystem,
+            customUser,
+            thinkingMode,
+            llmUrl: LLM_URL,
+            llmBase: LLM_BASE,
+            model: MODEL
+        });
     }
 
-    /** Push the current pause state to every open editor's corrector instance. */
     private applyPauseState() {
         for (const leaf of this.app.workspace.getLeavesOfType("markdown")) {
             const view = leaf.view as MarkdownView;
@@ -1238,7 +1206,6 @@ export default class FastTyperPlugin extends Plugin {
         }
     }
 
-    /** The CM6 EditorView backing the active markdown editor, if any. */
     private activeCm(): EditorView | null {
         const view = this.app.workspace.getActiveViewOfType(MarkdownView);
         if (!view) return null;

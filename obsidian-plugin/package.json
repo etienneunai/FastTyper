@@ -1,17 +1,17 @@
 {
   "name": "fasttyper-obsidian",
-  "version": "1.0.0",
-  "author": "etienneunai",
+  "version": "1.6.5",
+  "author": "FastTyper Contributors",
   "description": "Real-time grammar correction using local LLM",
   "main": "main.js",
   "scripts": {
-    "dev": "node esbuild.config.mjs",
-    "build": "node esbuild.config.mjs production"
+    "dev": "node generate-wordlist.mjs && node esbuild.config.mjs",
+    "build": "node generate-wordlist.mjs && tsc --noEmit && node esbuild.config.mjs production"
   },
   "devDependencies": {
     "@codemirror/language": "^6.0.0",
-    "@codemirror/state": "^6.0.0",
-    "@codemirror/view": "^6.0.0",
+    "@codemirror/state": "6.5.0",
+    "@codemirror/view": "6.38.6",
     "@types/node": "^18.0.0",
     "builtin-modules": "^3.3.0",
     "esbuild": "^0.17.0",

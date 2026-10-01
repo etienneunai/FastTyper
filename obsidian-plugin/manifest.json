@@ -2,9 +2,9 @@
   "id": "fasttyper",
   "name": "FastTyper",
   "version": "1.6.5",
-  "minAppVersion": "1.0.0",
+  "minAppVersion": "1.7.2",
   "description": "Real-time grammar correction powered by local Vulkan LLM.",
-  "author": "etienneunai",
-  "authorUrl": "",
-  "isDesktopOnly": false
+  "author": "FastTyper Contributors",
+  "authorUrl": "https://github.com/etienneunai/FastTyper",
+  "isDesktopOnly": true
 }

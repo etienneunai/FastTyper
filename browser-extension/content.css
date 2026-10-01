@@ -30,7 +30,7 @@
   overflow-wrap: break-word;
 }
 
-.ft-pill-change { white-space: nowrap; }
+.ft-pill-change { display: inline; }
 .ft-pill-was {
   color: #fca5a5;
   text-decoration: line-through;

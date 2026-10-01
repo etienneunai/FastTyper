@@ -6,42 +6,57 @@
 </head>
 <body>
   <h1>FastTyper</h1>
-  <label class="row"><input type="checkbox" id="paused"> Pause corrections</label>
-  <label class="row"><input type="checkbox" id="capitalize"> Capitalize sentence-initial letters</label>
-  <label for="prompt" class="bl-label">Correction prompt</label>
-  <select id="prompt" class="sel">
-    <option value="A">A — prod</option>
-    <option value="B">B — gram</option>
-    <option value="E">E — proof</option>
-    <option value="C">C — clean</option>
-    <option value="custom">Custom</option>
-  </select>
-  <label for="thinkingMode" class="bl-label">Thinking mode</label>
-  <select id="thinkingMode" class="sel">
-    <option value="fast">Fast — flat only</option>
-    <option value="auto">Auto — flat, then E+thinking on a miss</option>
-    <option value="always">Always — E+thinking every request</option>
-  </select>
-  <div id="customPrompts" hidden>
-    <label for="customSystem" class="bl-label">Custom system prompt</label>
-    <textarea id="customSystem" rows="2" placeholder="You are a spelling correction assistant."></textarea>
-    <label for="customUser" class="bl-label">Custom user prompt ({text} = the unit)</label>
-    <textarea id="customUser" rows="3" placeholder="Fix any spelling mistakes in this text. If there are no mistakes, output the text unchanged."></textarea>
-  </div>
-  <button id="acceptAll" class="btn">Accept all corrections</button>
-  <button id="halt" class="btn">Halt current correction</button>
-  <label for="llmBase" class="bl-label">LLM Base URL</label>
-  <input type="text" id="llmBase" class="txt" placeholder="http://127.0.0.1:8808">
-  <label for="model" class="bl-label">Model name</label>
-  <input type="text" id="model" class="txt" placeholder="dyslexic-writer-qwen3-4b-q4_k_m.gguf">
+
+  <!-- Primary controls: always visible -->
   <div id="status" class="status">Daemon: checking…</div>
-  <label for="blacklist" class="bl-label">Skip corrections on these sites (one per line)</label>
-  <textarea id="blacklist" rows="3" placeholder="example.com&#10;docs.google.com"></textarea>
-  <button id="saveBlacklist" class="btn">Save blacklist</button>
-  <details id="logWrap">
-    <summary>LLM exchange log</summary>
-    <pre id="log"></pre>
+  <label class="row"><input type="checkbox" id="paused"> Pause corrections</label>
+  <div class="btn-row">
+    <button id="acceptAll" class="btn">Accept all</button>
+    <button id="halt" class="btn btn-secondary">Halt</button>
+  </div>
+
+  <!-- Behavior settings -->
+  <details class="section">
+    <summary>Behavior</summary>
+    <label class="row"><input type="checkbox" id="capitalize"> Capitalize sentence-initial letters</label>
+    <label for="prompt" class="bl-label">Correction prompt</label>
+    <select id="prompt" class="sel">
+      <option value="A">A — prod</option>
+      <option value="B">B — gram</option>
+      <option value="E">E — proof</option>
+      <option value="C">C — clean</option>
+      <option value="custom">Custom</option>
+    </select>
+    <label for="thinkingMode" class="bl-label">Thinking mode</label>
+    <select id="thinkingMode" class="sel">
+      <option value="fast">Fast — flat only</option>
+      <option value="auto">Auto — flat, then E+thinking on a miss</option>
+      <option value="always">Always — E+thinking every request</option>
+    </select>
+    <div id="customPrompts" hidden>
+      <label for="customSystem" class="bl-label">Custom system prompt</label>
+      <textarea id="customSystem" rows="2" placeholder="You are a spelling correction assistant."></textarea>
+      <label for="customUser" class="bl-label">Custom user prompt ({text} = the unit)</label>
+      <textarea id="customUser" rows="3" placeholder="Fix any spelling mistakes in this text. If there are no mistakes, output the text unchanged."></textarea>
+    </div>
   </details>
+
+  <!-- Advanced settings -->
+  <details class="section">
+    <summary>Advanced</summary>
+    <label for="llmBase" class="bl-label">LLM Base URL</label>
+    <input type="text" id="llmBase" class="txt" placeholder="http://127.0.0.1:8808">
+    <label for="model" class="bl-label">Model name</label>
+    <input type="text" id="model" class="txt" placeholder="dyslexic-writer-qwen3-4b-q4_k_m.gguf">
+    <label for="blacklist" class="bl-label">Skip corrections on these sites (one per line)</label>
+    <textarea id="blacklist" rows="3" placeholder="example.com&#10;docs.google.com"></textarea>
+    <button id="saveBlacklist" class="btn">Save blacklist</button>
+    <details id="logWrap">
+      <summary>LLM exchange log</summary>
+      <pre id="log"></pre>
+    </details>
+  </details>
+
   <script src="popup.js"></script>
 </body>
 </html>

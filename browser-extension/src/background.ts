@@ -7,7 +7,7 @@
  * filesystem access, so the Obsidian plugin's llm-log.txt isn't available).
  */
 import {
-  buildPayload, DEFAULT_LLM_BASE, DEFAULT_MODEL, parseResponse, resolvePrompt, PROMPT_PRESETS,
+  buildPayload, DEFAULT_LLM_BASE, DEFAULT_MODEL, isInstructionEcho, parseResponse, resolvePrompt, PROMPT_PRESETS,
   type Request, type Response, type LogEntry, type PushMsg, type ThinkingMode,
 } from "./shared";
 
@@ -107,6 +107,7 @@ async function correct(text: string, thinking: boolean, url?: string, tabId?: nu
     if (typeof content !== "string") return null;
     const corrected = parseResponse(content);
     if (!corrected) return null;
+    if (isInstructionEcho(corrected)) return null;
     // Gross echo guard: the model shouldn't balloon the input 2x+200 chars.
     if (corrected.length > text.length * 2 + 200) return null;
     return corrected;
@@ -148,6 +149,28 @@ async function wordSet(): Promise<Set<string>> {
 // capitalized sentence start), or apostrophe tokens (contractions). Lone
 // lowercase "i" is a real typo for "I" and *is* a dictionary word, so it's
 // flagged explicitly.
+function isValidWord(token: string, ws: Set<string>): boolean {
+  if (ws.has(token)) return true;
+  if (token.endsWith("ed")) {
+    if (ws.has(token.slice(0, -2))) return true; // spellchecked -> spellcheck
+    if (ws.has(token.slice(0, -1))) return true; // baked -> bake
+    if (token.length > 4 && token[token.length - 3] === token[token.length - 4] && ws.has(token.slice(0, -3))) return true; // stopped -> stop
+  }
+  if (token.endsWith("ing")) {
+    if (ws.has(token.slice(0, -3))) return true; // spelling -> spell
+    if (ws.has(token.slice(0, -3) + "e")) return true; // dancing -> dance
+    if (token.length > 5 && token[token.length - 4] === token[token.length - 5] && ws.has(token.slice(0, -4))) return true; // running -> run
+  }
+  if (token.endsWith("s")) {
+    if (ws.has(token.slice(0, -1))) return true; // words -> word
+    if (token.endsWith("es") && ws.has(token.slice(0, -2))) return true; // boxes -> box
+  }
+  if (token.endsWith("ly")) {
+    if (ws.has(token.slice(0, -2))) return true; // quickly -> quick
+  }
+  return false;
+}
+
 const SUSPECT_REGEX = /[a-z]+(?:'[a-z]+)*/gi;
 async function hasSuspectTokens(text: string): Promise<boolean> {
   const ws = await wordSet();
@@ -160,7 +183,7 @@ async function hasSuspectTokens(text: string): Promise<boolean> {
     const token = raw.toLowerCase();
     if (token.includes("'")) continue;      // don't, it's, James'
     if (token.length === 1) { if (token === "i") return true; continue; }
-    if (!ws.has(token)) return true;
+    if (!isValidWord(token, ws)) return true;
   }
   return false;
 }
@@ -287,5 +310,12 @@ browser.commands.onCommand.addListener((command) => {
     getSettings().then((s) => saveSettings({ ...s, paused: !s.paused }));
   } else if (command === "halt-corrections") {
     browser.tabs.query({ active: true, currentWindow: true }).then((tabs) => haltProcessing(tabs[0]?.id));
+  } else if (command === "cycle-thinking-mode") {
+    getSettings().then((s) => {
+      const next: ThinkingMode = s.thinkingMode === "fast" ? "auto" : s.thinkingMode === "auto" ? "always" : "fast";
+      return saveSettings({ ...s, thinkingMode: next });
+    });
+  } else if (command === "accept-all-corrections") {
+    broadcast({ type: "acceptAll" });
   }
 });

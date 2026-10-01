@@ -22,7 +22,7 @@
  */
 import {
   TRIGGER_VERIFY_MS, MAX_UNIT_CHARS, MIN_UNIT_CHARS, ABBREVIATIONS,
-  diffWords, capitalizeInitial, contextSnippet, maskMarkdown, restoreMarkdown,
+  diffWords, capitalizeInitial, contextSnippet,
   type DiffHunk, type PushMsg, type ThinkingMode, type Response
 } from "./shared";
 
@@ -100,6 +100,7 @@ browser.runtime.onMessage.addListener((msg: PushMsg) => {
 interface Field {
   el: HTMLElement;
   kind: "textarea" | "contenteditable";
+  isVirtual?: boolean;
   readText(): string;
   caret(): number;
   setCaret(pos: number): void;
@@ -303,10 +304,20 @@ function modelRange(model: ContentModel, from: number, to: number): Range {
   return range;
 }
 
+function isVirtualDomEditor(el: HTMLElement): boolean {
+  return !!el.closest(
+    "[data-lexical-editor], [data-slate-editor], .ProseMirror, .DraftEditor-root, [data-contents='true'], .ql-editor, [role='textbox'][contenteditable='true'], [role='combobox'][contenteditable='true']"
+  );
+}
+
 class ContentEditableField implements Field {
   el: HTMLElement;
   kind: "contenteditable" = "contenteditable";
-  constructor(el: HTMLElement) { this.el = el; }
+  isVirtual: boolean;
+  constructor(el: HTMLElement) {
+    this.el = el;
+    this.isVirtual = isVirtualDomEditor(el);
+  }
   private _cachedModel: ContentModel | null = null;
   private model(): ContentModel {
     if (this._cachedModel) return this._cachedModel;
@@ -425,6 +436,12 @@ function prevToken(text: string, pos: number): string {
   return text.slice(start, pos + 1);
 }
 
+/** True if the line begins a list item ("- ", "* ", "+ ", "1. ", "1) ", "[ ] "). */
+function isListMarkerLine(lineText: string): boolean {
+  const t = lineText.trimStart();
+  return /^[-*+]\s/.test(t) || /^\d+[.)]\s/.test(t) || /^\[[ xX\-]\]\s/.test(t);
+}
+
 function sentenceSpan(text: string, blockStart: number, blockEnd: number, triggerPos: number): { from: number; to: number } {
   let clusterStart = triggerPos;
   while (clusterStart > blockStart) {
@@ -432,8 +449,15 @@ function sentenceSpan(text: string, blockStart: number, blockEnd: number, trigge
     if (c !== "." && c !== "?" && c !== "!") break;
     clusterStart--;
   }
-  let from = blockStart;
-  for (let i = clusterStart - 1; i >= blockStart; i--) {
+
+  // A list item should not swallow previous items: clamp scan-back to the line start.
+  const prevNl = text.lastIndexOf("\n", triggerPos - 1);
+  const lineStart = prevNl === -1 ? 0 : prevNl + 1;
+  const lineText = text.slice(lineStart, triggerPos + 1);
+  const hardStop = isListMarkerLine(lineText) ? Math.max(blockStart, lineStart) : blockStart;
+
+  let from = hardStop;
+  for (let i = clusterStart - 1; i >= hardStop; i--) {
     const c = text[i];
     if (c === "." || c === "?" || c === "!") { from = i + 1; break; }
   }
@@ -514,6 +538,24 @@ class Corrector {
       if (ABBREVIATIONS.has(prevToken(text, pos))) return;
     }
 
+    // A newline must not re-trigger a line whose terminating punctuation
+    // already fired the sentence trigger (avoids double-processing a line
+    // that ends with . ? !).
+    if (ch === "\n") {
+      if (pos <= 0) return;
+      const prevNL = text.lastIndexOf("\n", pos - 1);
+      const lineText = text.slice(prevNL + 1, pos);
+      const lastNonWs = lineText.trimEnd();
+      if (lastNonWs.length > 0) {
+        const lastCh = lastNonWs[lastNonWs.length - 1];
+        if (lastCh === "?" || lastCh === "!") return;
+        if (lastCh === ".") {
+          const prev = prevToken(text, prevNL + 1 + lastNonWs.length - 1);
+          if (!(prev && ABBREVIATIONS.has(prev))) return;
+        }
+      }
+    }
+
     const blockStart = field.blockStart(pos);
     const blockEnd = field.blockEnd(pos);
     const span = ch === "\n"
@@ -522,8 +564,7 @@ class Corrector {
     if (span.to - span.from > MAX_UNIT_CHARS) return;
     const unit = text.slice(span.from, span.to);
     if (unit.trim().length < MIN_UNIT_CHARS) return;
-    const { masked } = maskMarkdown(unit);
-    if (!/[a-zA-Z]/.test(masked.replace(/█/g, ''))) return;
+    if (!/[a-zA-Z]/.test(unit)) return;
 
     // If the unit overlaps an already-applied (still-active) correction, the
     // user is editing the corrected text — don't substitute over it again.
@@ -550,8 +591,7 @@ class Corrector {
       const trimmed = raw.trim();
       const lead = raw.length - raw.trimStart().length;
       if (trimmed.length < MIN_UNIT_CHARS) return;
-      const { masked, maskChars } = maskMarkdown(trimmed);
-      if (!/[a-zA-Z]/.test(masked.replace(/█/g, ''))) return;
+      if (!/[a-zA-Z]/.test(trimmed)) return;
 
       // "auto" tries flat once, then escalates to E + thinking ONLY if flat
       // changed nothing. A thinking no-op is final (thinking is non-deterministic
@@ -560,10 +600,8 @@ class Corrector {
       for (let attempt = 0; attempt < maxAttempts; attempt++) {
         const thinking = thinkingMode === "always" || attempt === 1;
         if (thinking) updateProcessingPill(q.field, true);
-        const correctedMasked = await this.request(masked, thinking);
+        const corrected = await this.request(trimmed, thinking);
         if (this.gen !== g || paused || active !== q.field) return;
-        if (!correctedMasked) return;
-        const corrected = restoreMarkdown(correctedMasked, maskChars);
         if (!corrected) return;
 
         const rawCorrected = corrected;
@@ -587,7 +625,7 @@ class Corrector {
           if (q.field.readText().slice(q.from, q.to).trim() !== trimmed) return;
           const hunks = diffWords(trimmed, final);
           if (hunks.length > 0) {
-            const changes = applyHunks(q.field, q.from, lead, trimmed, hunks);
+            const changes = applyHunks(q.field, q.from, lead, trimmed, hunks, final);
             for (const pending of this.queued) {
               if (pending.field === q.field) {
                 pending.from = mapCaret(pending.from, changes);
@@ -714,7 +752,7 @@ function wrapRange(root: HTMLElement, from: number, to: number, className: strin
 }
 
 /** Textarea applied ranges (approximate offsets), keyed by field element, for the re-correction guard. */
-const textApplied = new Map<HTMLElement, { from: number; to: number }[]>();
+const textApplied = new WeakMap<HTMLElement, { from: number; to: number }[]>();
 
 function registerTextApplied(field: Field, ranges: { from: number; to: number }[]): void {
   const el = field.el;
@@ -735,7 +773,7 @@ function unregisterTextApplied(field: Field, ranges: { from: number; to: number 
 
 /** True if the unit [from,to) overlaps an active (un-accepted) correction in this field. */
 function hasAppliedOverlap(field: Field, from: number, to: number): boolean {
-  if (field.kind === "contenteditable") {
+  if (field.kind === "contenteditable" && !field.isVirtual) {
     const model = buildModel(field.el);
     for (const d of decos) {
       if (!field.el.contains(d.span)) continue;
@@ -755,7 +793,7 @@ function hasAppliedOverlap(field: Field, from: number, to: number): boolean {
 
 export let isApplying = false;
 
-function applyHunks(field: Field, spanStart: number, lead: number, trimmed: string, hunks: DiffHunk[]): { from: number; to: number; ins: string }[] {
+function applyHunks(field: Field, spanStart: number, lead: number, trimmed: string, hunks: DiffHunk[], finalText?: string): { from: number; to: number; ins: string }[] {
   isApplying = true;
   try {
     const base = spanStart + lead;
@@ -774,6 +812,19 @@ function applyHunks(field: Field, spanStart: number, lead: number, trimmed: stri
       field.setValue(v);
       field.setCaret(mapCaret(caretBefore, changes));
       showCorrectionPill(field, base, trimmed, hunks);
+      return changes;
+    }
+
+    // Virtual-DOM contenteditable (Lexical, Slate, ProseMirror, etc.):
+    // Perform a single atomic replacement over the target unit and use the
+    // floating pill for Undo. NEVER inject <span> tags into their private AST!
+    if (field.isVirtual && finalText !== undefined) {
+      const caretBefore = field.caret();
+      const changes = [{ from: base, to: base + trimmed.length, ins: finalText }];
+      field.replace(base, base + trimmed.length, finalText);
+      field.invalidate();
+      field.setCaret(mapCaret(caretBefore, changes));
+      showCorrectionPill(field, base, trimmed, hunks, finalText);
       return changes;
     }
 
@@ -829,7 +880,8 @@ function acceptAll(): void {
     d.span.replaceWith(...Array.from(d.span.childNodes));
   }
   decos.length = 0;
-  textApplied.clear();
+  // WeakMap has no .clear(); unregister per-pill applied ranges instead.
+  for (const p of pills) unregisterTextApplied(p.field, p.appliedRanges);
   hideTooltip();
   dismissAllPills();
 }
@@ -844,32 +896,33 @@ interface Pill {
 }
 const pills: Pill[] = [];
 
-/** The corrected sentence, with each changed word shown as `was → now`. */
+/** Make whitespace visible by replacing spaces with middle dots. */
+function visibleSpaces(s: string): string { return s.replace(/ /g, "\u00B7"); }
+
+/** Compact diff summary: only the changed hunks, separated by " · ". */
 function buildHighlighted(trimmed: string, hunks: DiffHunk[]): HTMLElement {
   const body = document.createElement("div");
   body.className = "ft-pill-body";
-  let pos = 0;
-  for (const h of hunks) {
-    if (h.from > pos) body.appendChild(document.createTextNode(trimmed.slice(pos, h.from)));
+  for (let i = 0; i < hunks.length; i++) {
+    if (i > 0) body.appendChild(document.createTextNode(" · "));
+    const h = hunks[i];
     const mark = document.createElement("span");
     mark.className = "ft-pill-change";
     const was = document.createElement("span");
     was.className = "ft-pill-was";
-    was.textContent = trimmed.slice(h.from, h.to) || "∅";
+    was.textContent = visibleSpaces(trimmed.slice(h.from, h.to)) || "∅";
     const arrow = document.createTextNode(" → ");
     const now = document.createElement("span");
     now.className = "ft-pill-now";
-    now.textContent = h.replacement;
+    now.textContent = visibleSpaces(h.replacement) || "∅";
     mark.append(was, arrow, now);
     body.appendChild(mark);
-    pos = h.to;
   }
-  if (pos < trimmed.length) body.appendChild(document.createTextNode(trimmed.slice(pos)));
   return body;
 }
 
 /** One pill per correction event, aggregating every hunk in the sentence. */
-function showCorrectionPill(field: Field, base: number, trimmed: string, hunks: DiffHunk[]): void {
+function showCorrectionPill(field: Field, base: number, trimmed: string, hunks: DiffHunk[], finalText?: string): void {
   const pill = document.createElement("div");
   pill.className = "ft-pill";
   pill.appendChild(buildHighlighted(trimmed, hunks));
@@ -893,18 +946,28 @@ function showCorrectionPill(field: Field, base: number, trimmed: string, hunks: 
 
   // Record the applied range (guard against re-correcting while editing) and
   // the reverse hunks (undo), all in post-apply field coordinates.
-  const appliedRanges = hunks.map((h) => ({ from: base + h.from, to: base + h.to }));
-  const undoHunks = hunks.map((h) => ({
-    from: base + h.from,
-    len: h.replacement.length,
-    original: trimmed.slice(h.from, h.to),
-    ins: h.replacement,
-  }));
+  const appliedRanges = field.isVirtual && finalText !== undefined
+    ? [{ from: base, to: base + finalText.length }]
+    : hunks.map((h) => ({ from: base + h.from, to: base + h.to }));
+
+  const undoHunks = field.isVirtual && finalText !== undefined
+    ? [{ from: base, len: finalText.length, original: trimmed, ins: finalText }]
+    : hunks.map((h) => ({
+        from: base + h.from,
+        len: h.replacement.length,
+        original: trimmed.slice(h.from, h.to),
+        ins: h.replacement,
+      }));
   registerTextApplied(field, appliedRanges);
 
   positionPill(pill, field.el);
-  const timer = setTimeout(() => removePill(pill), 8000);
-  pills.push({ el: pill, field, undoHunks, appliedRanges, timer });
+  let timer = setTimeout(() => removePill(pill), 8000);
+  const p: Pill = { el: pill, field, undoHunks, appliedRanges, timer };
+  pills.push(p);
+
+  // Pause auto-hide while the user is hovering (e.g. moving to the Undo button).
+  pill.addEventListener("mouseenter", () => { clearTimeout(p.timer); });
+  pill.addEventListener("mouseleave", () => { p.timer = setTimeout(() => removePill(pill), 3000); });
 }
 
 function positionPill(pill: HTMLElement, anchor: HTMLElement): void {
@@ -949,7 +1012,19 @@ function undoPill(pill: HTMLElement): void {
     }
   }
   if (changes.length > 0) {
-    p.field.setValue(nv);
+    if (p.field.kind === "textarea") {
+      p.field.setValue(nv);
+    } else {
+      isApplying = true;
+      try {
+        for (const ch of changes) {
+          p.field.replace(ch.from, ch.to, ch.ins);
+        }
+        p.field.invalidate();
+      } finally {
+        isApplying = false;
+      }
+    }
     p.field.setCaret(mapCaret(caretBefore, changes));
   }
   unregisterTextApplied(p.field, p.appliedRanges);
@@ -1091,5 +1166,28 @@ document.addEventListener("input", (e) => {
 
 document.addEventListener("focusin", (e) => {
   if (siteDisabled) return;
+  // Sweep orphaned decos (SPA re-renders, user deleted corrected text).
+  for (let i = decos.length - 1; i >= 0; i--) {
+    if (!document.body.contains(decos[i].span)) decos.splice(i, 1);
+  }
   onFocusIn(e.target as HTMLElement);
 }, true);
+
+// ---------------------------------------------------------------------------
+// Scroll / resize: reposition all floating elements so they track their anchor
+// ---------------------------------------------------------------------------
+
+let rafPending = false;
+function repositionFloaters(): void {
+  if (rafPending) return;
+  rafPending = true;
+  requestAnimationFrame(() => {
+    rafPending = false;
+    for (const p of pills) positionPill(p.el, p.field.el);
+    if (processingPill) positionPill(processingPill.el, processingPill.field.el);
+    hideTooltip(); // tooltip re-appears on next mouseenter
+  });
+}
+
+document.addEventListener("scroll", repositionFloaters, { capture: true, passive: true });
+window.addEventListener("resize", repositionFloaters, { passive: true });

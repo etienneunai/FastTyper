@@ -186,7 +186,7 @@ Universal real-time grammar correction across web text fields, communicating wit
 - **Protected Fields**: Password/credential fields, Google Docs (canvas), and hidden-textarea mirrored editors (CodeMirror, Monaco, Notion) are automatically bypassed.
 - **Domain Blacklist**: Block specific hostnames or subdomains from the popup.
 - **Revert UX**: Contenteditable fields get inline wavy underlines and hover tooltips; plain textareas get transient diff pills with one-click sentence undo.
-- **Shortcuts**: `Ctrl+Shift+F` (Pause/Resume), `Ctrl+Shift+E` (Halt in-flight request and abort daemon connection).
+- **Shortcuts**: `Ctrl+Shift+F` (Pause/Resume), `Ctrl+Shift+E` (Halt in-flight request and abort daemon connection), `Ctrl+Shift+Y` (Cycle thinking mode), `Ctrl+Shift+A` (Accept all active corrections).
 
 ### Build & Load in Firefox
 

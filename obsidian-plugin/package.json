@@ -1,6 +1,6 @@
 {
   "name": "fasttyper-obsidian",
-  "version": "1.6.5",
+  "version": "1.6.6",
   "author": "FastTyper Contributors",
   "description": "Real-time grammar correction using local LLM",
   "main": "main.js",

@@ -1,7 +1,7 @@
 .grammar-applied-underline {
-    text-decoration: underline wavy var(--text-accent, #3b82f6);
+    text-decoration: underline wavy #3b82f6;
     text-decoration-skip-ink: none;
-    background-color: var(--background-modifier-accent, rgba(59, 130, 246, 0.1));
+    background-color: rgba(59, 130, 246, 0.1);
 }
 
 .grammar-deletion-marker {
@@ -10,7 +10,7 @@
     height: 0.9em;
     margin: 0 1px;
     vertical-align: baseline;
-    background-color: var(--text-accent, #3b82f6);
+    background-color: #3b82f6;
     opacity: 0.6;
     border-radius: 1px;
 }
@@ -18,9 +18,9 @@
 /* In-flight indicator: the unit currently being corrected (amber, distinct from
    the blue applied `.grammar-applied-underline`). Pulses while thinking. */
 .ft-processing {
-    text-decoration: underline wavy var(--text-warning, #f59e0b);
+    text-decoration: underline wavy #f59e0b;
     text-decoration-skip-ink: none;
-    background-color: var(--background-modifier-warning, rgba(245, 158, 11, 0.12));
+    background-color: rgba(245, 158, 11, 0.12);
 }
 
 .ft-processing-thinking {

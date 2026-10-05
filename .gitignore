@@ -29,3 +29,4 @@ __pycache__/
 .npm/
 .DS_Store
 .vscode/
+backend/benchmark_results*.json
